@@ -199,7 +199,7 @@ PORT=18899 bash server/deepseek-openai.sh start
 HOST=0.0.0.0 PORT=8899 bash server/deepseek-openai.sh start
 ```
 
-> 建议端口与 OpenCode 的 `deepseek-web` provider 默认端口 8899 统一。
+> **注意**：Android/Termux 环境下 bun 1.3.14 无法 `nohup` 后台运行（`CouldntReadCurrentDirectory` 错误），管理脚本已适配为 `npx tsx`。
 
 ### API 端点
 
