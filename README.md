@@ -43,9 +43,8 @@ deepseek-web-cli-v3/
 
 ### 前置条件
 
-- **Node.js >= 18**（推荐 v26+）
+- **[Node.js](https://nodejs.org) 22+** 或 **[bun](https://bun.sh)** 运行时
 - **Chrome 浏览器**（仅首次登录时需要，带 `--remote-debugging-port=9222`）
-- **tsx**（TypeScript 执行器）
 - **playwright-core**（CDP 连接 Chrome 获取凭证，仅首次登录时需要）
 - Android Termux 额外：`android-tools` + `adb forward tcp:9222 localabstract:chrome_devtools_remote`
 
@@ -54,14 +53,14 @@ deepseek-web-cli-v3/
 ```bash
 # 1. 安装依赖（仅首次）
 npm install -g tsx
-npm install playwright-core
+npm install playwright-core     # CDP 连接 Chrome 获取凭证，仅首次登录时需要
 
-# 2. 启动 REPL（首次会自动触发登录）
+# 2. 启动 REPL（首次运行会自动触发登录流程）
 ./cli/chat.ts
 
-# 3. 或使用 bun 效率更高
+# 3. 或使用 bun 效率更高（自动安装 playwright-core 相关依赖）
 npm install -g bun
-bun run ./cli/chat.ts
+bun run cli/chat.ts
 ```
 
 凭证缺失或过期时自动通过 Chrome DevTools Protocol 捕获 cookie 和 bearer token，保存到 `cli/credentials.json`。
@@ -171,26 +170,36 @@ curl -s http://127.0.0.1:9222/json/version
 ### 前置条件
 
 - 有效的凭证（先通过 CLI 登录一次，复制 `credentials.json` 到 `server/.deepseek/`）
-- Node.js >= 18
+- [bun](https://bun.sh) 运行时
+- 需在项目根目录下运行（或设置 `DEEPSEEK_CONFIG_DIR` 环境变量）
 
 ### 快速开始
 
 ```bash
-# 启动服务（默认 127.0.0.1:8899）
-node /path/to/tsx/dist/cli.mjs server/bin/deepseek-openai.ts serve
+# 1. 准备凭证（先通过 CLI 登录一次）
+mkdir -p server/.deepseek
+cp cli/credentials.json server/.deepseek/credentials.json
 
-# 自定义端口
-node /path/to/tsx/dist/cli.mjs server/bin/deepseek-openai.ts serve --port 18899
+# 2. 前台启动服务（默认 127.0.0.1:8899）
+npx tsx server/bin/deepseek-openai.ts serve
+npx tsx server/bin/deepseek-openai.ts serve --port 18899     # 自定义端口
 
-# 或使用管理脚本
-bash server/deepseek-openai.sh start
-bash server/deepseek-openai.sh status
-bash server/deepseek-openai.sh stop
+# 3. 或使用 bun 效率更高
+bun run server/bin/deepseek-openai.ts serve
 
-# 验证
-curl http://127.0.0.1:8899/health
-curl http://127.0.0.1:8899/v1/models
+# 4. 或后台运行（管理脚本）
+bash server/deepseek-openai.sh start      # 后台启动
+bash server/deepseek-openai.sh status     # 查看运行状态
+bash server/deepseek-openai.sh restart    # 重启
+bash server/deepseek-openai.sh stop       # 停止
+bash server/deepseek-openai.sh logs       # 查看实时日志
+
+# 后台启动支持 HOST 和 PORT 环境变量
+PORT=18899 bash server/deepseek-openai.sh start
+HOST=0.0.0.0 PORT=8899 bash server/deepseek-openai.sh start
 ```
+
+> 建议端口与 OpenCode 的 `deepseek-web` provider 默认端口 8899 统一。
 
 ### API 端点
 
