@@ -262,7 +262,7 @@ for chunk in stream:
 
 ---
 
-## 工作原理
+## CLI 工作原理
 
 ```
 用户输入 → REPL 解析（/命令 / !透传 / 消息）
@@ -288,6 +288,39 @@ for chunk in stream:
 - **SessionStore**：会话 JSON 文件持久化
 - **ToolRegistry/ToolExecutor**：工具注册与执行（含用户确认机制）
 - **Hashline 核心**：行级 SHA1 哈希标注、ref 解析、编辑冲突检测、fileRev 版本校验、safeReapply 自动重定位
+
+---
+
+## Server 工作原理
+
+```
+OpenAI 客户端 (curl/OpenCode/SDK)
+    │ POST /v1/chat/completions
+    ▼
+openai-server.ts     ← 解析 OpenAI 格式请求，提取 auth key
+    │
+    ▼
+deepseek-client.ts   ← 纯协议中转，不做工具执行/提示词注入
+    │
+    ▼
+chat.deepseek.com    ← 原始 SSE 流
+    │
+    ▼
+openai-stream.ts     ← 格式转换（DeepSeek SSE → OpenAI SSE）
+    │
+    ▼
+OpenAI 客户端        ← 标准 SSE 流返回
+```
+
+核心模块（`server/src/` 5 个文件）：
+
+- **openai-server.ts**：HTTP 服务器，接收 OpenAI `/v1/chat/completions` 请求，按 auth key 维护独立会话
+- **deepseek-client.ts**：DeepSeek Web API 客户端，PoW 求解 + 流式聊天 + 文件上传（782 行）
+- **openai-stream.ts**：SSE 格式转换器，DeepSeek `ParseEvent` → OpenAI `data: {...}\n\n`
+- **credentials.ts**：凭据加载/验证（cookie + bearer + userAgent）
+- **types.ts**：所有类型定义
+
+**设计原则**：纯协议中转，不执行工具、不注入提示词、不操作文件系统。模型返回工具调用时直接透传给客户端。
 
 ---
 
