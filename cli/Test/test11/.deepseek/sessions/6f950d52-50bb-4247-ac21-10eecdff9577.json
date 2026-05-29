@@ -1,0 +1,52 @@
+{
+  "id": "6f950d52-50bb-4247-ac21-10eecdff9577",
+  "title": "中文助手问候用户",
+  "parentMessageId": 6,
+  "messages": [
+    {
+      "role": "user",
+      "content": "你好",
+      "timestamp": 1779960080650,
+      "parentMessageId": 2
+    },
+    {
+      "role": "assistant",
+      "content": "你好！很高兴见到你，有什么我可以帮你的吗？",
+      "timestamp": 1779960080650,
+      "parentMessageId": 2,
+      "messageId": 2
+    },
+    {
+      "role": "user",
+      "content": "Hello",
+      "timestamp": 1779960121114,
+      "parentMessageId": 2
+    },
+    {
+      "role": "assistant",
+      "content": "你好！请问有什么可以帮你的吗？",
+      "timestamp": 1779960121114,
+      "parentMessageId": 2,
+      "messageId": 4
+    },
+    {
+      "role": "user",
+      "content": "Hallo",
+      "timestamp": 1779960272180,
+      "parentMessageId": 4
+    },
+    {
+      "role": "assistant",
+      "content": "你好！这是德语问候，我也用中文回复你：你好！请问需要什么帮助吗？",
+      "timestamp": 1779960272180,
+      "parentMessageId": 4,
+      "messageId": 6
+    }
+  ],
+  "thinkEnabled": false,
+  "searchEnabled": true,
+  "modelType": "default",
+  "pendingFileIds": [],
+  "createdAt": 1779960016913,
+  "updatedAt": 1779960272180
+}

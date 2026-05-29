@@ -227,23 +227,37 @@ curl -s -N http://127.0.0.1:8899/v1/chat/completions \
 Server 实现了标准 OpenAI API 协议，任何支持自定义 API 地址的客户端都可以直接使用。
 
 **OpenCode**
-在项目根目录创建 `opencode.json`：
+
+1. 创建项目级 `opencode.json`（在项目根目录）：
 
 ```json
 {
+  "$schema": "https://opencode.ai/config.json",
   "provider": {
     "deepseek-local": {
-      "base_url": "http://127.0.0.1:8899/v1",
-      "api_key": "sk-local",
-      "models": ["deepseek-flash", "deepseek-pro"]
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "DeepSeek Local",
+      "options": {
+        "baseURL": "http://127.0.0.1:8899/v1"
+      },
+      "models": {
+        "deepseek-flash": {
+          "name": "DeepSeek Flash"
+        },
+        "deepseek-pro": {
+          "name": "DeepSeek Pro"
+        }
+      }
     }
   }
 }
 ```
 
+2. 在 OpenCode 中执行 `/connect`，选择 **Other**，输入 provider id `deepseek-local`，API key 填任意非空字符串（如 `sk-local`，Server 不做校验）。
+
 启动 OpenCode 前注意：
 - 确保 port 与 Server 一致
-- `api_key` 可以是任意非空字符串（Server 不做校验）
+- 如果多个项目共用同一个 Server，可将上述配置写入 `~/.config/opencode/opencode.jsonc`
 
 **NextChat / LobeChat / ChatBox**
 在设置中添加自定义 API 端点 `http://127.0.0.1:8899/v1`，API Key 填任意值，选择 `deepseek-flash` 或 `deepseek-pro`。

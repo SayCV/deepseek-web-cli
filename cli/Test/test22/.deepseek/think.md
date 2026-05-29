@@ -1,0 +1,4 @@
+- Break down core demand
+- Sort logical framework
+- Deduce multi-angle solutions
+- Check & optimize results
