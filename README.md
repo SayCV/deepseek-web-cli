@@ -294,9 +294,9 @@ for chunk in stream:
 
 ### 设计原则
 
-- **按 auth key 隔离会话**：不同客户端各自独立的 DeepSeek 会话
-- **单次请求单次响应**：不执行工具 loop，模型返回工具调用时透传给客户端
-- **Prompt 注入工具**：DeepSeek 网页 API 不支持原生 tool calling，Server 将 OpenAI tools 定义转换为 prompt 注入，从响应中解析 `tool_json` 代码块还原为标准 tool_calls 格式
+- **会话隔离**：通过指纹（system + 第一条用户消息）识别对话，每个 OpenCode 对话独立对应一个 DeepSeek 房间
+- **自动恢复**：网页端删除对话后自动重建房间并带历史；服务器重启后首条请求自动带完整历史
+- **Prompt 注入工具**：将 OpenAI tools 转为 prompt 注入，从响应解析 `tool_json` 还原为 `tool_calls`；同时透传 DeepSeek 原生 DSML 工具调用
 - **不操作文件系统**：不读写本地文件，不泄露敏感信息
 
 ### 工具调用机制
@@ -473,13 +473,13 @@ OpenAI 客户端        ← 标准 SSE 流返回
 
 核心模块（`server/src/` 5 个文件）：
 
-- **openai-server.ts**：HTTP 服务器，接收 OpenAI `/v1/chat/completions` 请求，按 auth key 维护独立会话。将 OpenAI tools 转换为 prompt 注入，解析响应中的 `tool_json` 代码块还原为 `tool_calls`
+- **openai-server.ts**：HTTP 服务器。接收 OpenAI `/v1/chat/completions` 请求，按对话指纹隔离会话，将 tools 转为 prompt 注入，解析 tool_json + DSML 原生工具调用，还原为 OpenAI tool_calls。支持会话自动恢复、房间重建带历史
 - **deepseek-client.ts**：DeepSeek Web API 客户端，PoW 求解 + 流式聊天 + 文件上传（782 行）
 - **openai-stream.ts**：SSE 格式转换器，DeepSeek `ParseEvent` → OpenAI `data: {...}\n\n`
 - **credentials.ts**：凭据加载/验证（cookie + bearer + userAgent）
 - **types.ts**：所有类型定义
 
-**设计原则**：按 auth key 隔离会话。DeepSeek 网页 API 无原生 tool calling，Server 通过 prompt 注入 + tool_json 解析实现工具调用透传。不操作文件系统。
+**设计原则**：按对话指纹隔离会话（各 OpenCode 对话独立 DeepSeek 房间）。网页 API 无原生 tool calling，通过 prompt 注入 + tool_json/DSML 双通道解析实现。服务器重启、网页删对话后自动重建房间并带历史。不操作文件系统。
 
 ---
 

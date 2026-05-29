@@ -14,6 +14,7 @@ interface ClientState {
   client: DeepSeekClient
   sessionId: string
   parentMessageId: number | null
+  fingerprint: string
 }
 
 const clientStates = new Map<string, ClientState>()
@@ -119,10 +120,36 @@ async function getOrCreateSession(
     client,
     sessionId,
     parentMessageId: null,
+    fingerprint: "",
   }
   clientStates.set(authKey, state)
 
   return { client, sessionId }
+}
+
+async function chatWithRetry(
+  client: DeepSeekClient,
+  authKey: string,
+  creds: Credentials,
+  rebuildPrompt: () => string,
+  ...args: Parameters<DeepSeekClient["chat"]>
+): Promise<ReadableStream<Uint8Array>> {
+  try {
+    return await client.chat(...args)
+  } catch {
+    const newClient = new DeepSeekClient(creds)
+    const newSessionId = await newClient.createChatSession()
+    clientStates.set(authKey, {
+      client: newClient,
+      sessionId: newSessionId,
+      parentMessageId: null,
+      fingerprint: "",
+    })
+    args[0] = newSessionId
+    args[1] = null
+    args[2] = rebuildPrompt()
+    return newClient.chat(...args)
+  }
 }
 
 function updateParentMessageId(
@@ -266,37 +293,90 @@ export async function startServer(
         const modelType = modelToType(model)
         const thinkingEnabled = modelType === "expert"
 
-        const { client, sessionId } = await getOrCreateSession(
+        const { client, sessionId: origSessionId } = await getOrCreateSession(
           creds,
           authKey,
         )
 
         const normalizedTools = body.tools?.length ? convertOpenAITools(body.tools) : []
 
-        let prompt = ""
+        let systemPrompt = ""
         let lastUserContent = ""
+        let history = ""
+        let assistantContent = ""
+        let toolResults = ""
         for (const msg of body.messages || []) {
           if (msg.role === "system") {
-            prompt += msg.content + "\n"
+            systemPrompt += msg.content + "\n"
           } else if (msg.role === "user") {
             lastUserContent = msg.content
+            if (history) history += "\n"
+            history += "用户: " + msg.content
+          } else if (msg.role === "assistant") {
+            if (msg.tool_calls) {
+              for (const tc of msg.tool_calls) {
+                assistantContent += `[调用 ${tc.function?.name || "unknown"}(${tc.function?.arguments})]\n`
+              }
+            } else if (msg.content) {
+              if (history) history += "\n"
+              history += "助手: " + msg.content
+            }
+          } else if (msg.role === "tool") {
+            toolResults += `[工具返回]\n${msg.content}\n`
           }
         }
-        if (lastUserContent) {
-          prompt += lastUserContent
+
+        const hasAssistantMessages = (body.messages || []).some(
+          (m: any) => m.role === "assistant"
+        )
+        const firstUser = (body.messages || []).find((m: any) => m.role === "user")
+        const fingerprint = (systemPrompt.slice(0, 100) + "|||" + (firstUser?.content || "")).slice(0, 200)
+        const existingState = clientStates.get(authKey)
+        const needsNewSession =
+          !existingState ||
+          !hasAssistantMessages ||
+          existingState.fingerprint !== fingerprint
+
+        if (needsNewSession) {
+          const newSessionId = await client.createChatSession()
+          clientStates.set(authKey, {
+            client,
+            sessionId: newSessionId,
+            parentMessageId: null,
+            fingerprint,
+          })
         }
-        if (normalizedTools.length > 0) {
-          prompt += "\n\n" + buildToolPrompt(normalizedTools) + "\n"
+
+        const { sessionId } = clientStates.get(authKey)!
+        const initialWithHistory = needsNewSession && hasAssistantMessages
+
+        const buildPrompt = (withHistory: boolean) => {
+          let p = systemPrompt
+          if (normalizedTools.length > 0) {
+            p += "\n" + buildToolPrompt(normalizedTools) + "\n"
+          }
+          if (withHistory && history) {
+            p += "\n--- 对话历史 ---\n" + history + "\n---\n"
+          } else if (!withHistory && lastUserContent) {
+            p += lastUserContent + "\n"
+          }
+          if (assistantContent) p += assistantContent
+          if (toolResults) p += toolResults
+          return p
         }
 
         const isStream = body.stream !== false
 
         if (isStream) {
           const parser = new StreamParser()
-          const dsStream = await client.chat(
+          const dsStream = await chatWithRetry(
+            client,
+            authKey,
+            creds,
+            () => buildPrompt(true),
             sessionId,
             clientStates.get(authKey)?.parentMessageId ?? null,
-            prompt,
+            buildPrompt(initialWithHistory),
             thinkingEnabled,
             false,
             modelType,
@@ -317,8 +397,12 @@ export async function startServer(
                 allEvents.push(event)
               }
               let fullText = ""
+              const nativeToolCalls: ParseEvent[] = []
               for (const e of allEvents) {
                 if (e.type === "text_delta") fullText += e.content
+                if (e.type === "tool_call_start" || e.type === "tool_call_delta" || e.type === "tool_call_end") {
+                  nativeToolCalls.push(e)
+                }
               }
               const foundToolCalls = extractToolCallsFromText(fullText)
               if (foundToolCalls.length > 0) {
@@ -327,6 +411,12 @@ export async function startServer(
                 for (const tc of foundToolCalls) {
                   yield { type: "tool_call_start", id: tc.id, name: tc.name } as ParseEvent
                   yield { type: "tool_call_end", id: tc.id, name: tc.name, arguments: tc.arguments } as ParseEvent
+                }
+              } else if (nativeToolCalls.length > 0) {
+                for (const e of allEvents) {
+                  if (e.type === "text_delta" || e.type === "thinking_delta" || e.type === "tool_call_start" || e.type === "tool_call_delta" || e.type === "tool_call_end") {
+                    yield e
+                  }
                 }
               } else {
                 for (const e of allEvents) {
@@ -376,16 +466,20 @@ export async function startServer(
         }
 
         const parser = new StreamParser()
-        const dsStream = await client.chat(
+        const dsStream = await chatWithRetry(
+          client,
+          authKey,
+          creds,
+          () => buildPrompt(true),
           sessionId,
           clientStates.get(authKey)?.parentMessageId ?? null,
-          prompt,
+          buildPrompt(initialWithHistory),
           thinkingEnabled,
           false,
           modelType,
           [],
           undefined,
-          body.tools,
+          undefined,
         )
 
         const events = await collectEvents(parser, dsStream)
