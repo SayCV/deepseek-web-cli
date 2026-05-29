@@ -181,7 +181,7 @@ curl -s http://127.0.0.1:9222/json/version
 
 ## Server — OpenAI 兼容 HTTP API
 
-纯协议中转服务，将 OpenAI 格式请求翻译为 DeepSeek 私有 API 调用，返回标准 SSE 流。接收 `/v1/chat/completions` 请求。
+纯协议中转服务，将 OpenAI 格式请求翻译为 DeepSeek 私有 API 调用，返回标准 SSE 流。接收 `/v1/chat/completions` 请求。支持 OpenAI tool calling 协议（通过 prompt 注入实现）。
 
 ### 前置条件
 
@@ -294,13 +294,44 @@ for chunk in stream:
 
 ### 设计原则
 
-- **纯协议中转**：不执行工具、不注入提示词、不操作文件系统
 - **按 auth key 隔离会话**：不同客户端各自独立的 DeepSeek 会话
-- **单次请求单次响应**：无工具执行循环，模型返回工具调用时直接透传给客户端
+- **单次请求单次响应**：不执行工具 loop，模型返回工具调用时透传给客户端
+- **Prompt 注入工具**：DeepSeek 网页 API 不支持原生 tool calling，Server 将 OpenAI tools 定义转换为 prompt 注入，从响应中解析 `tool_json` 代码块还原为标准 tool_calls 格式
+- **不操作文件系统**：不读写本地文件，不泄露敏感信息
 
----
+### 工具调用机制
 
-## CLI 工作原理
+DeepSeek 网页版 API 没有原生 tool calling 接口，Server 采用与 CLI 相同的 prompt 注入方案：
+
+```
+客户端发送                                  Server 转换
+┌─────────────────────────┐               ┌─────────────────────────┐
+│ tools: [{                │   注入到       │ ## 可用工具             │
+│   type:"function",      │  ──→ prompt ──→ │ [{"name":"read",       │
+│   function:{            │               │   "parameters":{        │
+│     name:"read",        │               │     "path":"string"}}]  │
+│     parameters:{...}    │               │ ...                     │
+│ }}]                     │               │ 只回复 tool_json 代码块  │
+└─────────────────────────┘               └─────────────────────────┘
+                                                      │
+                                                      ▼
+                                              DeepSeek 模型响应
+                                               ```tool_json
+                                               {"tool":"read",
+                                                "parameters":{
+                                                  "path":"/etc/host"}}
+                                               ```
+                                                      │
+                                                      ▼
+                                              解析还原为 OpenAI 格式
+                                              choices[0].delta.tool_calls
+```
+
+任何支持 OpenAI 协议的客户端都可通过此机制使用工具调用。
+
+> ⚠️ 依赖于 DeepSeek 网页模型理解 `tool_json` 格式，非官方 API，可能存在不稳定性。
+
+### CLI 工作原理
 
 ```
 用户输入 → REPL 解析（/命令 / !透传 / 消息）
@@ -422,14 +453,17 @@ plus_one 只是格式示例，不是真实工具。
 OpenAI 客户端 (curl/OpenCode/SDK)
     │ POST /v1/chat/completions
     ▼
-openai-server.ts     ← 解析 OpenAI 格式请求，提取 auth key
-    │
+openai-server.ts     ← 解析 OpenAI 格式请求，按 auth key 隔离会话
+    │                   将 tools 转换为 prompt 注入
     ▼
-deepseek-client.ts   ← 纯协议中转，不做工具执行/提示词注入
+deepseek-client.ts   ← API 客户端（PoW + 流式聊天）
     │
     ▼
 chat.deepseek.com    ← 原始 SSE 流
     │
+    ▼
+openai-server.ts     ← 解析响应中的 tool_json 代码块
+    │                   还原为 OpenAI tool_calls 格式
     ▼
 openai-stream.ts     ← 格式转换（DeepSeek SSE → OpenAI SSE）
     │
@@ -439,13 +473,13 @@ OpenAI 客户端        ← 标准 SSE 流返回
 
 核心模块（`server/src/` 5 个文件）：
 
-- **openai-server.ts**：HTTP 服务器，接收 OpenAI `/v1/chat/completions` 请求，按 auth key 维护独立会话
+- **openai-server.ts**：HTTP 服务器，接收 OpenAI `/v1/chat/completions` 请求，按 auth key 维护独立会话。将 OpenAI tools 转换为 prompt 注入，解析响应中的 `tool_json` 代码块还原为 `tool_calls`
 - **deepseek-client.ts**：DeepSeek Web API 客户端，PoW 求解 + 流式聊天 + 文件上传（782 行）
 - **openai-stream.ts**：SSE 格式转换器，DeepSeek `ParseEvent` → OpenAI `data: {...}\n\n`
 - **credentials.ts**：凭据加载/验证（cookie + bearer + userAgent）
 - **types.ts**：所有类型定义
 
-**设计原则**：纯协议中转，不执行工具、不注入提示词、不操作文件系统。模型返回工具调用时直接透传给客户端。
+**设计原则**：按 auth key 隔离会话。DeepSeek 网页 API 无原生 tool calling，Server 通过 prompt 注入 + tool_json 解析实现工具调用透传。不操作文件系统。
 
 ---
 

@@ -18,6 +18,76 @@ interface ClientState {
 
 const clientStates = new Map<string, ClientState>()
 
+// ==================== Tool Prompt Injection ====================
+// DeepSeek web API does not natively support OpenAI-compatible tool calls.
+// Instead we inject tool definitions into the prompt and parse the
+// response text for ```tool_json { ... }``` code blocks.
+
+const FENCED_TOOL_JSON_REGEX = /```tool_json\s*\n?\s*(\{[\s\S]*\})\s*\n?\s*```/
+
+interface ExtractedToolCall {
+  id: string
+  name: string
+  arguments: Record<string, unknown>
+}
+
+function convertOpenAITools(tools: any[]): { name: string; description: string; parameters: Record<string, string> }[] {
+  return tools.map(t => {
+    const fn = t.function || t
+    const params: Record<string, string> = {}
+    if (fn.parameters?.properties) {
+      for (const [key, val] of Object.entries(fn.parameters.properties as Record<string, any>)) {
+        params[key] = (val as any).type || "string"
+      }
+    }
+    return { name: fn.name, description: fn.description, parameters: params }
+  })
+}
+
+function buildToolPrompt(tools: { name: string; description: string; parameters: Record<string, string> }[]): string {
+  const compact = tools.map(t => ({
+    name: t.name,
+    description: t.description,
+    parameters: t.parameters,
+  }))
+  return [
+    "## 可用工具",
+    JSON.stringify(compact),
+    "调用工具时，只回复以下格式的代码块，不要附加任何说明文字：",
+    "```tool_json",
+    '{"tool":"工具名","parameters":{参数对象}}',
+    "```",
+  ].join("\n")
+}
+
+function extractToolCallsFromText(text: string): ExtractedToolCall[] {
+  const results: ExtractedToolCall[] = []
+  const fenced = text.match(FENCED_TOOL_JSON_REGEX)
+  if (fenced) {
+    try {
+      const parsed = JSON.parse(fenced[1])
+      if (parsed.tool && typeof parsed.parameters === "object") {
+        results.push({
+          id: "call_" + randomStr(24),
+          name: parsed.tool,
+          arguments: parsed.parameters as Record<string, unknown>,
+        })
+      }
+    } catch {}
+  }
+  return results
+}
+
+function stripToolJson(text: string): string | null {
+  const idx = text.indexOf("```tool_json")
+  if (idx === -1) return text
+  const before = text.substring(0, idx).trim()
+  const endIdx = text.indexOf("```", idx + 12)
+  const after = endIdx !== -1 ? text.substring(endIdx + 3).trim() : ""
+  const result = (before + " " + after).trim()
+  return result || null
+}
+
 const AVAILABLE_MODELS = [
   { id: "deepseek-flash", object: "model", created: 1735689600, owned_by: "deepseek" },
   { id: "deepseek-pro", object: "model", created: 1735689600, owned_by: "deepseek" },
@@ -81,228 +151,6 @@ async function collectEvents(
     events.push(event)
   }
   return events
-}
-
-async function handleChatCompletion(
-  creds: Credentials,
-  body: any,
-  authKey: string,
-): Promise<http.ServerResponse> {
-  const stream = body.stream !== false
-  const tools = body.tools || body.toolsSchema
-  const modelType = modelToType(body.model || "deepseek-chat")
-
-  const { client, sessionId } = await getOrCreateSession(creds, authKey)
-  const state = clientStates.get(authKey)!
-
-  const toolRegistry = new ToolRegistry()
-  registerBuiltinTools(toolRegistry)
-
-  const toolExecutor = new ToolExecutor(toolRegistry)
-  const thinkingEnabled = modelType === "expert"
-
-  const maxToolIterations = 10
-  let prompt = ""
-  let lastMessageId: number | null = null
-
-  for (const msg of body.messages) {
-    if (msg.role === "system") {
-      prompt += msg.content + "\n"
-    } else if (msg.role === "tool") {
-      prompt += `\n[工具结果: ${msg.tool_call_id}]\n${msg.content}\n`
-    } else if (msg.role === "assistant") {
-      prompt += msg.content || ""
-    } else if (msg.role === "user") {
-      prompt += msg.content || ""
-    }
-  }
-
-  let finalStream: ReadableStream<Uint8Array> | null = null
-  let allToolCalls: ParseEvent[] = []
-
-  for (let iteration = 0; iteration < maxToolIterations; iteration++) {
-    const parser = new StreamParser()
-    const dsStream = await client.chat(
-      sessionId,
-      state.parentMessageId,
-      prompt,
-      thinkingEnabled,
-      false,
-      modelType,
-      [],
-      undefined,
-      body.tools,
-    )
-
-    const events = await collectEvents(parser, dsStream)
-
-    const toolCalls: ParseEvent[] = []
-    let hasToolCalls = false
-
-    for (const event of events) {
-      if (event.type === "tool_call_end") {
-        hasToolCalls = true
-        toolCalls.push(event)
-      }
-      if (event.type === "message_id") {
-        lastMessageId = event.id
-      }
-    }
-
-    if (!hasToolCalls) {
-      finalStream = await client.chat(
-        sessionId,
-        state.parentMessageId,
-        prompt,
-        thinkingEnabled,
-        false,
-        modelType,
-        [],
-        undefined,
-        body.tools,
-      )
-      allToolCalls = events.filter(
-        (e) => e.type === "tool_call_end" || e.type === "tool_call_start",
-      )
-      break
-    }
-
-    for (const tc of toolCalls) {
-      if (tc.type !== "tool_call_end") continue
-      try {
-        const result = await toolExecutor.execute(
-          tc.name,
-          tc.arguments,
-        )
-        prompt += `\n[工具结果: ${tc.name}]\n${result}\n`
-      } catch (err: any) {
-        prompt += `\n[工具错误: ${tc.name}]\n${err.message}\n`
-      }
-    }
-
-    if (iteration === maxToolIterations - 1) {
-      const lastParser = new StreamParser()
-      finalStream = await client.chat(
-        sessionId,
-        state.parentMessageId,
-        prompt,
-        thinkingEnabled,
-        false,
-        modelType,
-        [],
-        undefined,
-        body.tools,
-      )
-    }
-  }
-
-  if (lastMessageId) {
-    updateParentMessageId(authKey, lastMessageId)
-  }
-
-  if (stream) {
-    const lastParser = new StreamParser()
-    const eventSource = lastParser.parse(finalStream!)
-
-    if (allToolCalls.length > 0) {
-      const includeToolCalls = true
-      const openaiStream = createOpenAIStream(
-        eventSource,
-        { model: body.model || "deepseek-chat", includeToolCalls },
-      )
-      const reader = openaiStream.getReader()
-      const responseStream = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          const { done, value } = await reader.read()
-          if (done) {
-            controller.close()
-            return
-          }
-          controller.enqueue(value)
-        },
-      })
-      const buf = await collectStream(responseStream)
-      return createResponse(200, { "Content-Type": "text/event-stream" }, buf)
-    }
-
-    const includeToolCalls = true
-    const openaiStream = createOpenAIStream(
-      eventSource,
-      { model: body.model || "deepseek-chat", includeToolCalls },
-    )
-    const reader = openaiStream.getReader()
-    const chunks: Uint8Array[] = []
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      chunks.push(value)
-    }
-    const buf = Buffer.concat(chunks)
-    return createResponse(200, { "Content-Type": "text/event-stream" }, buf)
-  }
-
-  const parser = new StreamParser()
-  const events = await collectEvents(parser, finalStream!)
-
-  let content = ""
-  for (const event of events) {
-    if (event.type === "text_delta") content += event.content
-  }
-
-  const responseBody = JSON.stringify({
-    id: "chatcmpl-" + randomStr(29),
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: body.model || "deepseek-chat",
-    choices: [
-      {
-        index: 0,
-        message: {
-          role: "assistant",
-          content,
-        },
-        finish_reason: "stop",
-      },
-    ],
-    usage: {
-      prompt_tokens: 0,
-      completion_tokens: 0,
-      total_tokens: 0,
-    },
-  })
-
-  return createResponse(
-    200,
-    { "Content-Type": "application/json" },
-    Buffer.from(responseBody),
-  )
-}
-
-async function collectStream(
-  stream: ReadableStream<Uint8Array>,
-): Promise<Buffer> {
-  const reader = stream.getReader()
-  const chunks: Uint8Array[] = []
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-    chunks.push(value)
-  }
-  return Buffer.concat(chunks)
-}
-
-function createResponse(
-  status: number,
-  headers: Record<string, string>,
-  body: Buffer,
-): http.ServerResponse {
-  const res = new http.ServerResponse(
-    null as any,
-  ) as http.ServerResponse & { _status: number; _headers: Record<string, string>; _body: Buffer }
-  ;(res as any)._status = status
-  ;(res as any)._headers = headers
-  ;(res as any)._body = body
-  return res
 }
 
 function randomStr(length: number): string {
@@ -423,17 +271,22 @@ export async function startServer(
           authKey,
         )
 
+        const normalizedTools = body.tools?.length ? convertOpenAITools(body.tools) : []
+
         let prompt = ""
+        let lastUserContent = ""
         for (const msg of body.messages || []) {
           if (msg.role === "system") {
             prompt += msg.content + "\n"
           } else if (msg.role === "user") {
-            prompt += msg.content + "\n"
-          } else if (msg.role === "assistant") {
-            if (msg.content) prompt += msg.content + "\n"
-          } else if (msg.role === "tool") {
-            prompt += `[工具结果: ${msg.tool_call_id}] ${msg.content}\n`
+            lastUserContent = msg.content
           }
+        }
+        if (lastUserContent) {
+          prompt += lastUserContent
+        }
+        if (normalizedTools.length > 0) {
+          prompt += "\n\n" + buildToolPrompt(normalizedTools) + "\n"
         }
 
         const isStream = body.stream !== false
@@ -449,10 +302,51 @@ export async function startServer(
             modelType,
             [],
             undefined,
-            body.tools,
+            undefined,
           )
 
-          const openaiStream = createOpenAIStream(parser.parse(dsStream), {
+          const rawEvents = parser.parse(dsStream)
+
+          const events = (async function* () {
+            if (normalizedTools.length > 0) {
+              const allEvents: ParseEvent[] = []
+              for await (const event of rawEvents) {
+                if (event.type === "message_id") {
+                  updateParentMessageId(authKey, event.id)
+                }
+                allEvents.push(event)
+              }
+              let fullText = ""
+              for (const e of allEvents) {
+                if (e.type === "text_delta") fullText += e.content
+              }
+              const foundToolCalls = extractToolCallsFromText(fullText)
+              if (foundToolCalls.length > 0) {
+                const cleaned = stripToolJson(fullText)
+                if (cleaned) yield { type: "text_delta", content: cleaned } as ParseEvent
+                for (const tc of foundToolCalls) {
+                  yield { type: "tool_call_start", id: tc.id, name: tc.name } as ParseEvent
+                  yield { type: "tool_call_end", id: tc.id, name: tc.name, arguments: tc.arguments } as ParseEvent
+                }
+              } else {
+                for (const e of allEvents) {
+                  if (e.type === "text_delta" || e.type === "thinking_delta") {
+                    yield e
+                  }
+                }
+              }
+              yield { type: "end" } as ParseEvent
+            } else {
+              for await (const event of rawEvents) {
+                if (event.type === "message_id") {
+                  updateParentMessageId(authKey, event.id)
+                }
+                yield event
+              }
+            }
+          })()
+
+          const openaiStream = createOpenAIStream(events, {
             model: idToModelName(model),
             includeToolCalls: true,
           })
@@ -512,6 +406,23 @@ export async function startServer(
           }
           if (event.type === "message_id") {
             updateParentMessageId(authKey, event.id)
+          }
+        }
+
+        if (toolCalls.length === 0 && normalizedTools.length > 0) {
+          const foundToolCalls = extractToolCallsFromText(content)
+          if (foundToolCalls.length > 0) {
+            for (const tc of foundToolCalls) {
+              toolCalls.push({
+                id: tc.id,
+                type: "function",
+                function: {
+                  name: tc.name,
+                  arguments: JSON.stringify(tc.arguments),
+                },
+              })
+            }
+            content = stripToolJson(content) || null
           }
         }
 
