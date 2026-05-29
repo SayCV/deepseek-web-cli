@@ -1,25 +1,73 @@
 import * as http from "node:http"
+import * as path from "node:path"
+import * as fs from "node:fs"
+import * as crypto from "node:crypto"
 import { loadCredentials } from "./credentials.js"
 import { DeepSeekClient, StreamParser, ParseEvent } from "./deepseek-client.js"
 import { createOpenAIStream } from "./openai-stream.js"
 import type { Credentials, ToolDefinition } from "./types.js"
 
+let DEBUG = false
+function debugLog(...args: any[]) {
+  if (DEBUG) console.log(...args)
+}
+
 export interface StartServerOptions {
   port?: number
   host?: string
   credentials?: Credentials
+  debug?: boolean
 }
 
-interface ClientState {
+interface ConversationState {
   client: DeepSeekClient
   sessionId: string
   parentMessageId: number | null
-  fingerprint: string
 }
 
-const clientStates = new Map<string, ClientState>()
+const sessions = new Map<string, Map<string, ConversationState>>()
 
-// ==================== Tool Prompt Injection ====================
+const SESSIONS_FILE = path.join(
+  process.env.DEEPSEEK_CONFIG_DIR || path.join(path.dirname(new URL(import.meta.url).pathname), ".."),
+  ".deepseek", "sessions.json"
+)
+
+function saveSessions() {
+  try {
+    const dir = path.dirname(SESSIONS_FILE)
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true })
+    const data: Record<string, Record<string, { sessionId: string; parentMessageId: number | null }>> = {}
+    for (const [authKey, conversations] of sessions) {
+      const authData: Record<string, { sessionId: string; parentMessageId: number | null }> = {}
+      for (const [fingerprint, conv] of conversations) {
+        authData[fingerprint] = { sessionId: conv.sessionId, parentMessageId: conv.parentMessageId }
+      }
+      data[authKey] = authData
+    }
+    fs.writeFileSync(SESSIONS_FILE, JSON.stringify(data))
+  } catch {}
+}
+
+function loadSessions() {
+  try {
+    if (!fs.existsSync(SESSIONS_FILE)) return
+    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, "utf8"))
+    for (const [authKey, authData] of Object.entries(data)) {
+      const conversations = new Map<string, ConversationState>()
+      const record = authData as Record<string, any>
+      for (const [fingerprint, conv] of Object.entries(record)) {
+        conversations.set(fingerprint, {
+          client: null as any,
+          sessionId: (conv as any).sessionId,
+          parentMessageId: (conv as any).parentMessageId ?? null,
+        })
+      }
+      sessions.set(authKey, conversations)
+    }
+  } catch {}
+}
+
+// ━━━━━━━━━━━━━ Tool Prompt Injection ━━━━━━━━━━━━━
 // DeepSeek web API does not natively support OpenAI-compatible tool calls.
 // Instead we inject tool definitions into the prompt and parse the
 // response text for ```tool_json { ... }``` code blocks.
@@ -104,32 +152,20 @@ function idToModelName(id: string): string {
   return id === "deepseek-flash" ? "deepseek-flash" : "deepseek-pro"
 }
 
-async function getOrCreateSession(
-  creds: Credentials,
-  authKey: string,
-): Promise<{ client: DeepSeekClient; sessionId: string }> {
-  let state = clientStates.get(authKey)
-  if (state && state.client) {
-    return { client: state.client, sessionId: state.sessionId }
+async function getOrCreateClient(creds: Credentials, authKey: string): Promise<DeepSeekClient> {
+  const conversations = sessions.get(authKey)
+  if (conversations) {
+    for (const conv of conversations.values()) {
+      if (conv.client) return conv.client
+    }
   }
-
-  const client = new DeepSeekClient(creds)
-  const sessionId = await client.createChatSession()
-
-  state = {
-    client,
-    sessionId,
-    parentMessageId: null,
-    fingerprint: "",
-  }
-  clientStates.set(authKey, state)
-
-  return { client, sessionId }
+  return new DeepSeekClient(creds)
 }
 
 async function chatWithRetry(
   client: DeepSeekClient,
   authKey: string,
+  fingerprint: string,
   creds: Credentials,
   rebuildPrompt: () => string,
   ...args: Parameters<DeepSeekClient["chat"]>
@@ -139,12 +175,15 @@ async function chatWithRetry(
   } catch {
     const newClient = new DeepSeekClient(creds)
     const newSessionId = await newClient.createChatSession()
-    clientStates.set(authKey, {
-      client: newClient,
-      sessionId: newSessionId,
-      parentMessageId: null,
-      fingerprint: "",
-    })
+    const conversations = sessions.get(authKey)
+    if (conversations) {
+      conversations.set(fingerprint, {
+        client: newClient,
+        sessionId: newSessionId,
+        parentMessageId: null,
+      })
+      saveSessions()
+    }
     args[0] = newSessionId
     args[1] = null
     args[2] = rebuildPrompt()
@@ -154,11 +193,13 @@ async function chatWithRetry(
 
 function updateParentMessageId(
   authKey: string,
+  fingerprint: string,
   parentMessageId: number,
 ): void {
-  const state = clientStates.get(authKey)
-  if (state) {
-    state.parentMessageId = parentMessageId
+  const conv = sessions.get(authKey)?.get(fingerprint)
+  if (conv) {
+    conv.parentMessageId = parentMessageId
+    saveSessions()
   }
 }
 
@@ -190,15 +231,17 @@ function randomStr(length: number): string {
   return result
 }
 
+let roundCounter = 0
+
 export function cleanupSession(sessionId: string): void {
-  const keysToDelete: string[] = []
-  for (const [key, state] of clientStates) {
-    if (state.sessionId === sessionId) {
-      keysToDelete.push(key)
+  for (const [authKey, conversations] of sessions) {
+    for (const [fingerprint, conv] of conversations) {
+      if (conv.sessionId === sessionId) {
+        conversations.delete(fingerprint)
+        if (conversations.size === 0) sessions.delete(authKey)
+        return
+      }
     }
-  }
-  for (const key of keysToDelete) {
-    clientStates.delete(key)
   }
 }
 
@@ -207,6 +250,7 @@ export async function startServer(
 ): Promise<http.Server> {
   const port = options.port ?? 8899
   const host = options.host ?? "127.0.0.1"
+  DEBUG = options.debug ?? false
 
   let creds: Credentials
 
@@ -223,6 +267,8 @@ export async function startServer(
     creds = loaded
   }
 
+  loadSessions()
+
   const server = http.createServer(
     async (req: http.IncomingMessage, res: http.ServerResponse) => {
       const url = new URL(req.url || "/", `http://${host}:${port}`)
@@ -235,12 +281,6 @@ export async function startServer(
       if (method === "OPTIONS") {
         res.writeHead(204)
         res.end()
-        return
-      }
-
-      if (url.pathname === "/health" || url.pathname === "/api/health") {
-        res.writeHead(200, { "Content-Type": "application/json" })
-        res.end(JSON.stringify({ status: "ok" }))
         return
       }
 
@@ -270,8 +310,9 @@ export async function startServer(
                 type: "authentication_error",
               },
             }),
-          )
-          return
+        )
+        if (isOneShot) client.deleteSession(sessionId).catch(() => {})
+        return
         }
         creds = loadedCreds
 
@@ -289,101 +330,151 @@ export async function startServer(
           return
         }
 
+        const roundNum = ++roundCounter
+        const msgCount = (body.messages || []).length
+        debugLog(`\n${"━".repeat(60)}`)
+        debugLog(`[ROUND ${roundNum}] NEW REQUEST  model=${body.model || "?"}  messages=${msgCount}`)
+        debugLog(`${"━".repeat(60)}`)
+
         const model = body.model || "deepseek-chat"
         const modelType = modelToType(model)
         const thinkingEnabled = modelType === "expert"
-
-        const { client, sessionId: origSessionId } = await getOrCreateSession(
-          creds,
-          authKey,
-        )
 
         const normalizedTools = body.tools?.length ? convertOpenAITools(body.tools) : []
 
         let systemPrompt = ""
         let lastUserContent = ""
-        let history = ""
         let assistantContent = ""
         let toolResults = ""
+        let currentAssistant = ""
+        let currentTools = ""
         for (const msg of body.messages || []) {
           if (msg.role === "system") {
             systemPrompt += msg.content + "\n"
           } else if (msg.role === "user") {
             lastUserContent = msg.content
-            if (history) history += "\n"
-            history += "用户: " + msg.content
+            currentAssistant = ""
+            currentTools = ""
           } else if (msg.role === "assistant") {
             if (msg.tool_calls) {
               for (const tc of msg.tool_calls) {
-                assistantContent += `[调用 ${tc.function?.name || "unknown"}(${tc.function?.arguments})]\n`
+                const line = `[调用 ${tc.function?.name || "unknown"}(${tc.function?.arguments})]\n`
+                assistantContent += line
+                currentAssistant += line
               }
-            } else if (msg.content) {
-              if (history) history += "\n"
-              history += "助手: " + msg.content
             }
           } else if (msg.role === "tool") {
-            toolResults += `[工具返回]\n${msg.content}\n`
+            const block = `[工具返回]\n${msg.content}\n`
+            toolResults += block
+            currentTools += block
           }
         }
 
-        const hasAssistantMessages = (body.messages || []).some(
-          (m: any) => m.role === "assistant"
-        )
-        const firstUser = (body.messages || []).find((m: any) => m.role === "user")
-        const fingerprint = (systemPrompt.slice(0, 100) + "|||" + (firstUser?.content || "")).slice(0, 200)
-        const existingState = clientStates.get(authKey)
-        const needsNewSession =
-          !existingState ||
-          !hasAssistantMessages ||
-          existingState.fingerprint !== fingerprint
+        const isOneShot = normalizedTools.length === 0 && !systemPrompt.includes("opencode")
 
-        if (needsNewSession) {
-          const newSessionId = await client.createChatSession()
-          clientStates.set(authKey, {
-            client,
-            sessionId: newSessionId,
-            parentMessageId: null,
-            fingerprint,
-          })
+        let client: DeepSeekClient
+        let sessionId: string
+        let fingerprint = ""
+
+        if (isOneShot) {
+          client = new DeepSeekClient(creds)
+          sessionId = await client.createChatSession()
+        } else {
+          const firstUser = (body.messages || []).find((m: any) => m.role === "user")
+          fingerprint = crypto.createHash("sha256").update(authKey + "::" + (firstUser?.content || "")).digest("hex").slice(0, 16)
+
+          client = await getOrCreateClient(creds, authKey)
+
+          const conversations = sessions.get(authKey) || new Map()
+          sessions.set(authKey, conversations)
+
+          const hasAssistantMessages = (body.messages || []).some(
+            (m: any) => m.role === "assistant"
+          )
+
+          let convState = conversations.get(fingerprint)
+          if (!convState || !hasAssistantMessages) {
+            sessionId = await client.createChatSession()
+            convState = { client, sessionId, parentMessageId: null }
+            conversations.set(fingerprint, convState)
+            saveSessions()
+          }
+
+          sessionId = conversations.get(fingerprint)!.sessionId
         }
 
-        const { sessionId } = clientStates.get(authKey)!
-        const initialWithHistory = needsNewSession && hasAssistantMessages
+        const isFirstMessage = isOneShot || !sessions.get(authKey)?.get(fingerprint)?.parentMessageId
 
-        const buildPrompt = (withHistory: boolean) => {
-          let p = systemPrompt
+        if (!isFirstMessage) {
+          assistantContent = currentAssistant
+          toolResults = currentTools
+        }
+
+        if (isOneShot) {
+          debugLog(`[REQ] Session: (one-shot)  sessionId: ${sessionId.slice(0, 12)}...`)
+        } else {
+          const curConv = sessions.get(authKey)!.get(fingerprint)!
+          debugLog(`[REQ] Session: ${curConv.sessionId.slice(0, 12)}...  fingerprint: ${fingerprint.slice(0, 8)}  parentMsgId: ${curConv.parentMessageId ?? "(null/首条)"}`)
+        }
+
+        let prompt = ""
+        if (isFirstMessage) {
+          prompt = systemPrompt
           if (normalizedTools.length > 0) {
-            p += "\n" + buildToolPrompt(normalizedTools) + "\n"
+            prompt += "\n" + buildToolPrompt(normalizedTools) + "\n"
           }
-          if (withHistory && history) {
-            p += "\n--- 对话历史 ---\n" + history + "\n---\n"
-          } else if (!withHistory && lastUserContent) {
-            p += lastUserContent + "\n"
-          }
-          if (assistantContent) p += assistantContent
-          if (toolResults) p += toolResults
-          return p
         }
+        if (assistantContent) prompt += assistantContent
+        if (toolResults) prompt += toolResults
+        if (lastUserContent && (isFirstMessage || !assistantContent)) {
+          prompt += "用户: " + lastUserContent + "\n"
+        }
+
+        debugLog(`[REQ] Prompt mode: ${isFirstMessage ? "FULL (含 system + tools)" : "INCREMENTAL (仅增量)"}`)
+        if (isFirstMessage) {
+          debugLog("[REQ] ━━━━━━━━━━━━━ SYSTEM PROMPT ━━━━━━━━━━━━━")
+          debugLog(systemPrompt || "(无)")
+          debugLog("[REQ] ━━━━━━━━━━━━━ TOOL DEFINITIONS ━━━━━━━━━━━━━")
+          debugLog(normalizedTools.length > 0 ? buildToolPrompt(normalizedTools) : "(无)")
+        }
+        debugLog("[REQ] ━━━━━━━━━━━━━ ACTUAL PROMPT SENT ━━━━━━━━━━━━━")
+        debugLog(prompt || "(空)")
+        debugLog("[REQ] ━━━━━━━━━━━━━ END ━━━━━━━━━━━━━")
+
+        const recoveryPrompt = (() => {
+          let p = systemPrompt
+          if (normalizedTools.length > 0) p += "\n" + buildToolPrompt(normalizedTools) + "\n"
+          for (const msg of body.messages || []) {
+            if (msg.role === "user") {
+              p += "用户: " + msg.content + "\n"
+            } else if (msg.role === "assistant") {
+              if (msg.tool_calls) {
+                for (const tc of msg.tool_calls) {
+                  p += `[调用 ${tc.function?.name || "unknown"}(${tc.function?.arguments})]\n`
+                }
+              } else if (msg.content) {
+                p += "助手: " + msg.content + "\n"
+              }
+            } else if (msg.role === "tool") {
+              p += `[工具返回]\n${msg.content}\n`
+            }
+          }
+          return p
+        })();
 
         const isStream = body.stream !== false
 
         if (isStream) {
           const parser = new StreamParser()
-          const dsStream = await chatWithRetry(
-            client,
-            authKey,
-            creds,
-            () => buildPrompt(true),
-            sessionId,
-            clientStates.get(authKey)?.parentMessageId ?? null,
-            buildPrompt(initialWithHistory),
-            thinkingEnabled,
-            false,
-            modelType,
-            [],
-            undefined,
-            undefined,
-          )
+          const dsStream = isOneShot
+            ? await client.chat(
+                sessionId, null, prompt, thinkingEnabled, false, modelType, [], undefined, undefined,
+              )
+            : await chatWithRetry(
+                client, authKey, fingerprint, creds, () => recoveryPrompt,
+                sessionId, sessions.get(authKey)?.get(fingerprint)?.parentMessageId ?? null,
+                prompt, thinkingEnabled, false, modelType, [], undefined, undefined,
+              )
 
           const rawEvents = parser.parse(dsStream)
 
@@ -392,7 +483,7 @@ export async function startServer(
               const allEvents: ParseEvent[] = []
               for await (const event of rawEvents) {
                 if (event.type === "message_id") {
-                  updateParentMessageId(authKey, event.id)
+                  updateParentMessageId(authKey, fingerprint, event.id)
                 }
                 allEvents.push(event)
               }
@@ -425,14 +516,23 @@ export async function startServer(
                   }
                 }
               }
+              debugLog(`\n[ROUND ${roundNum}] ━━━━━━━━━━━━━ STREAM RESPONSE ━━━━━━━━━━━━━`)
+              debugLog(`Text: ${fullText || "(无)"}`)
+              if (nativeToolCalls.length > 0) debugLog(`Native tool calls: ${nativeToolCalls.length}`)
+              debugLog(`\n[ROUND ${roundNum}] ━━━━━━━━━━━━━ END ━━━━━━━━━━━━━`)
               yield { type: "end" } as ParseEvent
             } else {
+              let streamText = ""
               for await (const event of rawEvents) {
                 if (event.type === "message_id") {
-                  updateParentMessageId(authKey, event.id)
+                  updateParentMessageId(authKey, fingerprint, event.id)
                 }
+                if (event.type === "text_delta") streamText += event.content
                 yield event
               }
+              debugLog(`\n[ROUND ${roundNum}] ━━━━━━━━━━━━━ STREAM RESPONSE ━━━━━━━━━━━━━`)
+              debugLog(`Text: ${streamText || "(无)"}`)
+              debugLog(`\n[ROUND ${roundNum}] ━━━━━━━━━━━━━ END ━━━━━━━━━━━━━`)
             }
           })()
 
@@ -462,25 +562,20 @@ export async function startServer(
             res.write("data: [DONE]\n\n")
           }
           res.end()
+          if (isOneShot) client.deleteSession(sessionId).catch(() => {})
           return
         }
 
         const parser = new StreamParser()
-        const dsStream = await chatWithRetry(
-          client,
-          authKey,
-          creds,
-          () => buildPrompt(true),
-          sessionId,
-          clientStates.get(authKey)?.parentMessageId ?? null,
-          buildPrompt(initialWithHistory),
-          thinkingEnabled,
-          false,
-          modelType,
-          [],
-          undefined,
-          undefined,
-        )
+        const dsStream = isOneShot
+          ? await client.chat(
+              sessionId, null, prompt, thinkingEnabled, false, modelType, [], undefined, undefined,
+            )
+          : await chatWithRetry(
+              client, authKey, fingerprint, creds, () => recoveryPrompt,
+              sessionId, sessions.get(authKey)?.get(fingerprint)?.parentMessageId ?? null,
+              prompt, thinkingEnabled, false, modelType, [], undefined, undefined,
+            )
 
         const events = await collectEvents(parser, dsStream)
 
@@ -520,6 +615,11 @@ export async function startServer(
           }
         }
 
+        debugLog(`\n[ROUND ${roundNum}] ━━━━━━━━━━━━━ RESPONSE ━━━━━━━━━━━━━`)
+        debugLog(`Text: ${content || "(无)"}`)
+        if (toolCalls.length > 0) debugLog(`Tool calls: ${JSON.stringify(toolCalls)}`)
+        debugLog(`\n[ROUND ${roundNum}] ━━━━━━━━━━━━━ END ━━━━━━━━━━━━━`)
+
         res.writeHead(200, { "Content-Type": "application/json" })
         res.end(
           JSON.stringify({
@@ -556,13 +656,10 @@ export async function startServer(
   return new Promise<http.Server>((resolve, reject) => {
     server.on("error", reject)
     server.listen(port, host, () => {
-      console.log(
-        `DeepSeek OpenAI API 服务已启动`,
-      )
+      console.log(`DeepSeek OpenAI API 服务已启动`)
       console.log(`  地址: http://${host}:${port}`)
       console.log(`  API:  http://${host}:${port}/v1/chat/completions`)
       console.log(`  模型: http://${host}:${port}/v1/models`)
-      console.log(`  健康: http://${host}:${port}/health`)
       resolve(server)
     })
   })

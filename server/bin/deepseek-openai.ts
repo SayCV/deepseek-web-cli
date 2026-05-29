@@ -12,7 +12,8 @@ async function main() {
   if (command === "serve") {
     const host = readArg("--host", process.env.HOST || "127.0.0.1")
     const port = Number(readArg("--port", process.env.PORT || "8899"))
-    await startServer({ host, port })
+    const debug = process.argv.includes("--debug")
+    await startServer({ host, port, debug })
     return
   }
 

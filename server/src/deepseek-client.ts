@@ -151,6 +151,14 @@ export class DeepSeekClient {
     return sessionId
   }
 
+  async deleteSession(sessionId: string): Promise<void> {
+    const res = await fetch("https://chat.deepseek.com/api/v0/chat_session/delete", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({ chat_session_id: sessionId }),
+    })
+    if (!res.ok) throw new Error(`delete session failed (${res.status})`)
+  }
+
   private async createPowChallenge(targetPath: string) {
     const res = await fetch(
       "https://chat.deepseek.com/api/v0/chat/create_pow_challenge",

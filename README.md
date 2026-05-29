@@ -213,6 +213,13 @@ bash server/deepseek-openai.sh logs       # 查看实时日志
 # 后台启动支持 HOST 和 PORT 环境变量
 PORT=18899 bash server/deepseek-openai.sh start
 HOST=0.0.0.0 PORT=8899 bash server/deepseek-openai.sh start
+
+# 5. 开启调试日志（记录每轮请求/响应详情）
+bash server/deepseek-openai.sh start --debug
+bash server/deepseek-openai.sh restart --debug
+# 也支持前台启动
+npx tsx server/bin/deepseek-openai.ts serve --debug
+bun run ./server/bin/deepseek-openai.ts serve --debug
 ```
 
 
@@ -220,7 +227,6 @@ HOST=0.0.0.0 PORT=8899 bash server/deepseek-openai.sh start
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/health` | 健康检查 |
 | GET | `/v1/models` | 模型列表（deepseek-flash, deepseek-pro） |
 | POST | `/v1/chat/completions` | OpenAI 兼容聊天接口（支持 stream） |
 
@@ -294,10 +300,12 @@ for chunk in stream:
 
 ### 设计原则
 
-- **会话隔离**：通过指纹（system + 第一条用户消息）识别对话，每个 OpenCode 对话独立对应一个 DeepSeek 房间
-- **自动恢复**：网页端删除对话后自动重建房间并带历史；服务器重启后首条请求自动带完整历史
+- **多会话隔离**：按 authKey + 指纹（SHA256 哈希）双层路由，同一用户可同时保持多个独立对话
+- **增量提示**：利用 DeepSeek parentMessageId 记忆机制，首轮发送完整上下文（system + tools），后续仅发送增量（工具调用 + 结果 + 用户消息），大幅减少 token 消耗
+- **会话持久化**：`server/.deepseek/sessions.json` 保存 authKey → fingerprint → sessionId 映射，重启后直接续接
+- **One-shot 检测**：无工具的简短请求（如标题生成）自动创建临时房间，完成后清理云端会话
+- **自动恢复**：网页端删除对话后 chatWithRetry 自动重建房间
 - **Prompt 注入工具**：将 OpenAI tools 转为 prompt 注入，从响应解析 `tool_json` 还原为 `tool_calls`；同时透传 DeepSeek 原生 DSML 工具调用
-- **不操作文件系统**：不读写本地文件，不泄露敏感信息
 
 ### 工具调用机制
 
@@ -453,7 +461,7 @@ plus_one 只是格式示例，不是真实工具。
 OpenAI 客户端 (curl/OpenCode/SDK)
     │ POST /v1/chat/completions
     ▼
-openai-server.ts     ← 解析 OpenAI 格式请求，按 auth key 隔离会话
+openai-server.ts     ← 按 authKey 隔离用户，按对话指纹隔离会话
     │                   将 tools 转换为 prompt 注入
     ▼
 deepseek-client.ts   ← API 客户端（PoW + 流式聊天）
@@ -473,13 +481,13 @@ OpenAI 客户端        ← 标准 SSE 流返回
 
 核心模块（`server/src/` 5 个文件）：
 
-- **openai-server.ts**：HTTP 服务器。接收 OpenAI `/v1/chat/completions` 请求，按对话指纹隔离会话，将 tools 转为 prompt 注入，解析 tool_json + DSML 原生工具调用，还原为 OpenAI tool_calls。支持会话自动恢复、房间重建带历史
+- **openai-server.ts**：HTTP 服务器。按 authKey + 指纹双层路由实现多会话隔离，支持增量提示、one-shot 检测与清理。将 tools 转为 prompt 注入，解析 tool_json + DSML 原生工具调用。支持会话持久化与自动恢复
 - **deepseek-client.ts**：DeepSeek Web API 客户端，PoW 求解 + 流式聊天 + 文件上传（782 行）
 - **openai-stream.ts**：SSE 格式转换器，DeepSeek `ParseEvent` → OpenAI `data: {...}\n\n`
 - **credentials.ts**：凭据加载/验证（cookie + bearer + userAgent）
 - **types.ts**：所有类型定义
 
-**设计原则**：按对话指纹隔离会话（各 OpenCode 对话独立 DeepSeek 房间）。网页 API 无原生 tool calling，通过 prompt 注入 + tool_json/DSML 双通道解析实现。服务器重启、网页删对话后自动重建房间并带历史。不操作文件系统。
+**设计原则**：按 authKey + 指纹双层路由实现多会话隔离（同一用户可并行多个独立对话），会话信息持久化到 `sessions.json` 支持重启续接。首轮完整上下文 + 后续增量提示，显著降低 token 消耗。网页 API 无原生 tool calling，通过 prompt 注入 + tool_json/DSML 双通道解析实现。网页端删对话后自动重建。one-shot 请求自动清理云端会话。
 
 ---
 
