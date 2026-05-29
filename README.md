@@ -11,7 +11,7 @@
 ```
 deepseek-web-cli-v3/
 ├── cli/                       # 子项目 A：单文件交互式 REPL
-│   ├── chat.ts                # 约 3000 行，自包含
+│   ├── chat.ts                # 约 3100 行，自包含
 │   ├── tool.md                # 工具使用规范
 │   ├── Test/
 │   │   ├── test.test.ts       # 87 项自动化测试
@@ -397,13 +397,14 @@ OpenAI 客户端        ← 标准 SSE 流返回
 
 ```bash
 # CLI 自动化测试（87 项）
-node /path/to/tsx/dist/cli.mjs --test cli/Test/test.test.ts
+# 或使用 npx（需要先全局安装 tsx）
+npx tsx --test cli/Test/test.test.ts
 
 # 手动测试方案
 cat cli/Test/TEST_PLAN.md
 ```
 
-测试覆盖：哈希函数、标注输出、ref 解析、编辑操作、冲突检测、fileRev 校验、标注清洗、会话持久化、环境发现、工具调用解析（JSON/XML）、路径沙箱、web_fetch、边界情况等 15 个维度。无需凭证或网络连接。
+测试覆盖：哈希函数、标注输出、ref 解析、编辑操作、冲突检测、fileRev 校验、标注清洗、会话持久化、环境发现、工具调用解析（fenced/bare 格式）、路径沙箱、web_fetch、边界情况等 15 个维度。无需凭证或网络连接。
 
 ---
 
@@ -412,7 +413,7 @@ cat cli/Test/TEST_PLAN.md
 - **PoW 反爬**：嵌入 WASM 模块（base64 内联）计算 DeepSeekHashV1 / SHA256
 - **CDP 登录**：Chrome DevTools Protocol 自动捕获 cookie 和 bearer token
 - **SSE 解析**：从 OpenClaw Zero Token 移植 tagBuffer 状态机，支持 thinking/text/tool_call 标签
-- **JSON 工具调用**：`tool_json` 代码块 + 内联正则解析 + XML 属性格式 fallback
+- **JSON 工具调用**：```tool_json 代码块（fenced）和内联 JSON（bare）两种格式解析
 - **Hashline 安全编辑**：行级 SHA1 哈希标注、ref 解析、编辑冲突检测、fileRev 版本校验
 - **路径沙箱**：resolveWorkspacePath 限定文件操作于工作目录内
 

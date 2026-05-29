@@ -681,11 +681,6 @@ test("extractToolCall 解析裸 JSON 格式", () => {
   assert.deepEqual(call, { tool: "read", parameters: { path: "README.md" } })
 })
 
-test("extractToolCall 解析 XML name arguments 格式", () => {
-  const call = extractToolCall('<tool_call>{"name":"write","arguments":{"path":"a.txt","content":"hi"}}</tool_call>')
-  assert.deepEqual(call, { tool: "write", parameters: { path: "a.txt", content: "hi" } })
-})
-
 test("ToolRegistry.buildToolPrompt 包含 tool_json 示例和工具参数", () => {
   const registry = new ToolRegistry()
   registry.register({

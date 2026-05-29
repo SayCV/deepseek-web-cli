@@ -86,13 +86,9 @@ const JUNK_TOKENS = [
 
 // Thinking 提示词注入（开启思考模式时追加到用户消息末尾）
 const THINKING_INJECTION_PROMPT =
-  "Reasoning Effort: Absolute maximum with no shortcuts permitted.\n" +
-  "You MUST be very thorough in your thinking and comprehensively decompose " +
-  "the problem to resolve the root cause, rigorously stress-testing your logic " +
-  "against all potential paths, edge cases, and adversarial scenarios.\n" +
-  "Explicitly write out your entire deliberation process, documenting every " +
-  "intermediate step, considered alternative, and rejected hypothesis to ensure " +
-  "absolutely no assumption is left unchecked.";
+  "推理力度：绝对最大值，不允许任何捷径。\n" +
+  "你必须极其彻底地思考，全面分解问题以找到根因，严格对所有可能路径、边界情况和对抗场景进行逻辑压力测试。\n" +
+  "显式写出完整的推理过程，记录每一步中间结果、备选方案以及被否定的假设，确保没有任何假设未经审视。";
 
 // ============ 第4部分：工具函数 ============
 
@@ -136,7 +132,6 @@ function readFileIfExists(filePath: string): string {
 
 const FENCED_TOOL_JSON_REGEX = /```tool_json\s*\n?\s*(\{[\s\S]*?\})\}?\s*\n?\s*```/;
 const BARE_TOOL_JSON_REGEX = /\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*(\{[\s\S]*?\})\s*\}/;
-const XML_TOOL_CALL_REGEX = /<tool_call[^>]*>([\s\S]*?)<\/tool_call>/i;
 
 function parseToolJson(raw: string): ParsedToolCall | null {
   try {
@@ -147,9 +142,6 @@ function parseToolJson(raw: string): ParsedToolCall | null {
     const obj = JSON.parse(cleaned);
     if (obj.tool && typeof obj.tool === "string") {
       return { tool: obj.tool, parameters: obj.parameters ?? {} };
-    }
-    if (obj.name && typeof obj.name === "string") {
-      return { tool: obj.name, parameters: obj.arguments ?? {} };
     }
     return null;
   } catch {
@@ -169,24 +161,6 @@ function extractToolCall(text: string): ParsedToolCall | null {
       return null;
     }
   }
-
-  const xml = XML_TOOL_CALL_REGEX.exec(text);
-  if (xml) {
-    const parsed = parseToolJson(xml[1]);
-    if (parsed) return parsed;
-    // 处理 XML 属性格式: <tool_call name="read">{"path":"test.txt"}</tool_call>
-    const attrMatch = /<tool_call\s[^>]*name\s*=\s*"([^"]+)"/i.exec(xml[0]);
-    if (attrMatch) {
-      try {
-        const body = JSON.parse(xml[1].trim());
-        return { tool: attrMatch[1], parameters: body };
-      } catch { return null; }
-    }
-    return null;
-  }
-
-  const fuzzy = text.match(/\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"parameters"\s*:\s*\{([^}]*)\}/);
-  if (fuzzy) return parseToolJson(`{"tool":"${fuzzy[1]}","parameters":{${fuzzy[2]}}}`);
 
   return null;
 }
@@ -575,7 +549,8 @@ class DeepSeekClient {
     searchEnabled: boolean,
     modelType: string,
     refFileIds: string[] = [],
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    tools?: ToolDefinition[]
   ): Promise<ReadableStream<Uint8Array>> {
     const targetPath = "/api/v0/chat/completion";
     const challenge = await this.createPowChallenge(targetPath);
@@ -584,7 +559,7 @@ class DeepSeekClient {
       JSON.stringify({ ...challenge, answer, target_path: targetPath })
     ).toString("base64");
 
-    const body = JSON.stringify({
+    const bodyObj: Record<string, unknown> = {
       chat_session_id: sessionId,
       parent_message_id: parentMessageId ?? null,
       prompt: message,
@@ -593,7 +568,26 @@ class DeepSeekClient {
       search_enabled: searchEnabled,
       model_type: modelType,
       preempt: false,
-    });
+    };
+
+    if (tools && tools.length > 0) {
+      bodyObj.tools = tools.map((t) => ({
+        type: "function",
+        function: {
+          name: t.name,
+          description: t.description,
+          parameters: {
+            type: "object",
+            properties: Object.fromEntries(
+              Object.entries(t.parameters).map(([k, v]) => [k, { type: v.type, description: v.description }])
+            ),
+            required: Object.keys(t.parameters),
+          },
+        },
+      }));
+    }
+
+    const body = JSON.stringify(bodyObj);
 
     const res = await fetch(`https://chat.deepseek.com${targetPath}`, {
       method: "POST",
@@ -707,8 +701,9 @@ class DeepSeekClient {
 
 // ============ 第7部分：StreamParser ============
 
-class StreamParser {
+export class StreamParser {
   private tagBuffer = "";
+  private toolTextBuffer = "";
   private currentMode: "text" | "thinking" | "tool_call" = "text";
   private currentToolName = "";
   private currentToolId = "";
@@ -717,6 +712,7 @@ class StreamParser {
   private events: ParseEvent[] = [];
   private citationLinks: Map<number, string> = new Map();
   private currentFragmentType: string | null = null;
+  private textToolCallDetected = false;
 
   private emitText(content: string) {
     if (content) this.events.push({ type: "text_delta", content });
@@ -804,6 +800,9 @@ class StreamParser {
   }
 
   private processData(data: any) {
+    const vType = typeof data.v;
+    const path = data.v?.response?.fragments ? "fragments" : vType === "string" ? "v-string" : data.content ? "content" : data.p ? `p=${data.p}` : "other";
+
     // 收集 citation links
     this.collectCitations(data);
 
@@ -844,7 +843,6 @@ class StreamParser {
     } else if (data.v?.content && typeof data.v.content === "string") {
       content = data.v.content;
     } else if (data.v?.response?.fragments) {
-      // 处理 fragments 数组（首段回复）
       const frags = data.v.response.fragments;
       for (const frag of frags) {
         this.currentFragmentType = frag.type;
@@ -853,9 +851,9 @@ class StreamParser {
           this.pushDelta(frag.content, isThinking ? "thinking" : undefined);
         }
       }
+      this.checkTextToolCall();
       return;
     }
-    // 新 fragment 追加（如 response/fragments APPEND）
     if (data.p === "response/fragments" && Array.isArray(data.v)) {
       for (const frag of data.v) {
         this.currentFragmentType = frag.type;
@@ -864,6 +862,7 @@ class StreamParser {
           this.pushDelta(frag.content, isThinking ? "thinking" : undefined);
         }
       }
+      this.checkTextToolCall();
       return;
     }
 
@@ -923,7 +922,35 @@ class StreamParser {
     }
 
     this.tagBuffer += delta;
+    this.toolTextBuffer += delta;
+    if (!this.textToolCallDetected) {
+      const tc = extractToolCall(this.toolTextBuffer);
+      if (tc) {
+        this.textToolCallDetected = true;
+        this.toolTextBuffer = "";
+        this.tagBuffer = "";
+        this.events.push({ type: "tool_call_start", id: "", name: tc.tool });
+        this.events.push({ type: "tool_call_end", id: "", name: tc.tool, arguments: tc.parameters });
+      }
+    }
     this.checkTags();
+  }
+
+  private checkTextToolCall(): void {
+    const tc = extractToolCall(this.toolTextBuffer);
+    if (tc) {
+      this.events.push({
+        type: "tool_call_start",
+        id: "",
+        name: tc.tool,
+      });
+      this.events.push({
+        type: "tool_call_end",
+        id: "",
+        name: tc.tool,
+        arguments: tc.parameters,
+      });
+    }
   }
 
   private collectCitations(obj: any, seen?: WeakSet<object>): void {
@@ -1211,7 +1238,7 @@ class ToolRegistry {
       ),
     }));
     return [
-      "## Available Tools",
+      "## 可用工具",
       JSON.stringify(compactTools),
       "示例: 要给数字5加1，返回:",
       "```tool_json",
@@ -1224,7 +1251,17 @@ class ToolRegistry {
 }
 
 class ToolExecutor {
-  constructor(private registry: ToolRegistry, private workDir: string = process.cwd()) {}
+  private registry: ToolRegistry;
+  private workDir: string;
+
+  constructor(registry: ToolRegistry, workDir: string = process.cwd()) {
+    this.registry = registry;
+    this.workDir = workDir;
+  }
+
+  getToolDefinitions(): ToolDefinition[] {
+    return this.registry.list();
+  }
 
   setWorkDir(workDir: string): void {
     this.workDir = workDir;
@@ -1340,36 +1377,36 @@ class ToolExecutor {
 function registerBuiltinTools(registry: ToolRegistry): void {
   registry.register({
     name: "read",
-    description: "Read file content from a given path.",
-    parameters: { path: { type: "string", description: "File path" } },
+    description: "从给定路径读取文件内容。",
+    parameters: { path: { type: "string", description: "文件路径" } },
   });
   registry.register({
     name: "write",
-    description: "Write content to a file.",
+    description: "将内容写入文件。",
     parameters: {
-      path: { type: "string", description: "File path" },
-      content: { type: "string", description: "Content to write" },
+      path: { type: "string", description: "文件路径" },
+      content: { type: "string", description: "要写入的内容" },
     },
   });
   registry.register({
     name: "edit",
-    description: "Edit a file using hashline refs from read output. Args: filePath, operations (array of {op, startRef?, endRef?, ref?, content?}), fileRev?, safeReapply?. Ops: replace/delete/insert_before/insert_after/replace_range. use refs exactly as shown in read output.",
+    description: "使用 hashline ref 编辑文件。参数: filePath, operations (包含 {op, startRef?, endRef?, ref?, content?} 的数组), fileRev?, safeReapply?。操作: replace/delete/insert_before/insert_after/replace_range。引用格式请严格使用 read 输出中的格式。",
     parameters: {
-      filePath: { type: "string", description: "Path to the file" },
-      operations: { type: "string", description: "JSON array of operations with startRef/endRef from read output" },
-      fileRev: { type: "string", description: "REV token from read output to detect stale edits" },
-      safeReapply: { type: "string", description: "Allow relocating refs if hash matches but line moved" },
+      filePath: { type: "string", description: "文件路径" },
+      operations: { type: "string", description: "操作数组的 JSON，使用 read 输出中的 startRef/endRef" },
+      fileRev: { type: "string", description: "read 输出中的 REV 令牌，用于检测过期编辑" },
+      safeReapply: { type: "string", description: "如果 hash 匹配但行位置变化，允许重新定位 ref" },
     },
   });
   registry.register({
     name: "exec",
-    description: "Execute a system command and return the output.",
-    parameters: { command: { type: "string", description: "Command to run" } },
+    description: "执行系统命令并返回输出。",
+    parameters: { command: { type: "string", description: "要执行的命令" } },
   });
   registry.register({
     name: "web_fetch",
-    description: "Fetch an HTTP or HTTPS URL and return text content.",
-    parameters: { url: { type: "string", description: "URL to fetch" } },
+    description: "抓取 HTTP 或 HTTPS URL 并返回文本内容。",
+    parameters: { url: { type: "string", description: "要抓取的 URL" } },
   });
 }
 
@@ -1524,7 +1561,8 @@ class ChatSession {
         stream = await this.client.chat(
           this.state.id, currentParentId, currentPrompt,
           this.state.thinkEnabled, this.state.searchEnabled, this.state.modelType,
-          refIds, this.ac.signal
+          refIds, this.ac.signal,
+          undefined
         );
       } catch (err: any) {
         if (err.name === "AbortError") {
@@ -1588,7 +1626,7 @@ class ChatSession {
             yield event;
             try {
               const result = await this.toolExecutor.execute(event.name, event.arguments, this.rl);
-              currentPrompt = `\n<tool_response id="" name="${event.name}">\n${result}\n</tool_response>\n\nPlease proceed based on this tool result.`;
+              currentPrompt = `\n<tool_response id="" name="${event.name}">\n${result}\n</tool_response>\n\n请根据此工具结果继续。`;
             } catch (toolErr: any) {
               yield { type: "error", message: `工具执行失败: ${toolErr.message}` };
               this.ac = null;
@@ -2305,21 +2343,6 @@ async function handleCommand(
     case "raw": {
       ctx.rawMode = !ctx.rawMode;
       log(`📶 原始 SSE 数据流：${ctx.rawMode ? "开（调试用）" : "关"}`);
-      return session;
-    }
-
-    case "tool": {
-      if (!session) { log("❌ 没有活跃会话"); return session; }
-      if (args[0] === "on") {
-        session.setToolsPrompt(ctx.toolRegistry.buildToolPrompt());
-        session.setReinjectMode("keep");
-        log("🔧 工具模式：开（下条消息将重新注入提示词）");
-      } else if (args[0] === "off") {
-        session.setToolsPrompt("");
-        log("🔧 工具模式：关");
-      } else {
-        log("❌ 用法: /tool on 或 /tool off");
-      }
       return session;
     }
 

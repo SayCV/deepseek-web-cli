@@ -1,11 +1,11 @@
 ## 工具调用格式
 
-所有工具通过 `<tool_call>` XML 标签调用：
+所有工具通过 ````tool_json` 代码块调用：
 
 ```
-<tool_call name="工具名">
-{"参数名": "参数值"}
-</tool_call>
+```tool_json
+{"tool":"工具名","parameters":{"参数名":"参数值"}}
+
 ```
 
 ## edit 工具 — Hashline 行级哈希引用编辑
@@ -31,8 +31,8 @@ read 返回的内容每行带有 `#HL` 标注：
 
 **第二步：edit 引用标注**
 
-```json
-{
+```tool_json
+{"tool":"edit","parameters":{
   "filePath": "src/main.ts",
   "operations": [
     {
@@ -47,7 +47,7 @@ read 返回的内容每行带有 `#HL` 标注：
     }
   ],
   "fileRev": "A1B2C3D4"
-}
+}}
 ```
 
 **关键规则：**
@@ -105,8 +105,8 @@ edit → delete 第7行
 3 次网络往返，效率低，且中间文件可能被修改。
 
 ✅ **应该这样（一次调用全部完成）：**
-```json
-{
+```tool_json
+{"tool":"edit","parameters":{
   "filePath": "src/main.ts",
   "operations": [
     {"op": "replace", "startRef": "#HL 3#xxx#yyy", "content": "新第3行"},
@@ -114,7 +114,7 @@ edit → delete 第7行
     {"op": "delete", "startRef": "#HL 7#xxx#yyy"}
   ],
   "fileRev": "A1B2C3D4"
-}
+}}
 ```
 1 次往返，且所有操作的 refs 基于同一份 read 快照，一致性有保证。
 
@@ -122,29 +122,29 @@ edit → delete 第7行
 
 直接写入文件全部内容。**如果 content 中混入了 `#HL` 前缀，会被自动清洗，无需手动处理。**
 
-```json
-{
+```tool_json
+{"tool":"write","parameters":{
   "path": "src/newfile.ts",
   "content": "const x = 1\nconst y = 2\n"
-}
+}}
 ```
 
 ## read 工具 — 读取文件
 
 读取文件全部内容，输出自动带有 hashline 行哈希标注。无需任何额外参数。
 
-```json
-{
+```tool_json
+{"tool":"read","parameters":{
   "path": "src/main.ts"
-}
+}}
 ```
 
 ## exec 工具 — 执行系统命令
 
 执行 shell 命令并返回输出。
 
-```json
-{
+```tool_json
+{"tool":"exec","parameters":{
   "command": "ls -la src/"
-}
+}}
 ```
