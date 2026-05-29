@@ -120,8 +120,8 @@ export class DeepSeekClient {
       Referer: "https://chat.deepseek.com/",
       Origin: "https://chat.deepseek.com",
       "x-client-platform": "web",
-      "x-client-version": "1.7.0",
-      "x-app-version": "20241129.1",
+      "x-client-version": "2.0.0",
+      "x-app-version": "2.0.0",
       "x-client-locale": "zh_CN",
       "x-client-timezone-offset": "28800",
     }
@@ -140,8 +140,10 @@ export class DeepSeekClient {
     }
     const data: any = await res.json()
     const sessionId =
+      data?.data?.biz_data?.chat_session?.id ||
       data?.data?.biz_data?.id ||
       data?.data?.biz_data?.chat_session_id ||
+      data?.biz_data?.chat_session?.id ||
       data?.biz_data?.id ||
       data?.biz_data?.chat_session_id ||
       ""

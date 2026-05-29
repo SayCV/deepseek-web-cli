@@ -86,9 +86,8 @@ const JUNK_TOKENS = [
 
 // Thinking 提示词注入（开启思考模式时追加到用户消息末尾）
 const THINKING_INJECTION_PROMPT =
-  "推理力度：绝对最大值，不允许任何捷径。\n" +
-  "你必须极其彻底地思考，全面分解问题以找到根因，严格对所有可能路径、边界情况和对抗场景进行逻辑压力测试。\n" +
-  "显式写出完整的推理过程，记录每一步中间结果、备选方案以及被否定的假设，确保没有任何假设未经审视。";
+  "深度思考，分析问题本质，考虑边界情况和潜在风险。" +
+  "对于复杂任务，先规划再执行；简单任务直接处理，无需过度分析。";
 
 // ============ 第4部分：工具函数 ============
 
@@ -492,8 +491,8 @@ class DeepSeekClient {
       Referer: "https://chat.deepseek.com/",
       Origin: "https://chat.deepseek.com",
       "x-client-platform": "web",
-      "x-client-version": "1.7.0",
-      "x-app-version": "20241129.1",
+      "x-client-version": "2.0.0",
+      "x-app-version": "2.0.0",
       "x-client-locale": "zh_CN",
       "x-client-timezone-offset": "28800",
     };
@@ -512,13 +511,137 @@ class DeepSeekClient {
     }
     const data: any = await res.json();
     const sessionId =
+      data?.data?.biz_data?.chat_session?.id ||
       data?.data?.biz_data?.id ||
       data?.data?.biz_data?.chat_session_id ||
+      data?.biz_data?.chat_session?.id ||
       data?.biz_data?.id ||
       data?.biz_data?.chat_session_id ||
       "";
     if (!sessionId) throw new Error("Empty chat session ID");
     return sessionId;
+  }
+
+  async fetchSessionList(count = 20): Promise<Array<{
+    id: string; title: string; model_type: string;
+    pinned: boolean; updated_at: number;
+  }>> {
+    const res = await fetch(
+      `https://chat.deepseek.com/api/v0/chat_session/fetch_page?count=${count}`,
+      { method: "GET", headers: await this.headers(), signal: AbortSignal.timeout(15000) }
+    );
+    if (!res.ok) throw new Error(`获取云端会话列表失败 (${res.status})`);
+    const data: any = await res.json();
+    return data?.data?.biz_data?.chat_sessions || [];
+  }
+
+  async fetchHistoryMessages(sessionId: string): Promise<{
+    messages: Array<{ role: "user" | "assistant"; content: string; messageId: number | null }>;
+    currentMessageId: number | null;
+  }> {
+    const res = await fetch(
+      `https://chat.deepseek.com/api/v0/chat/history_messages?chat_session_id=${sessionId}&cache_version=0&cache_reset_at=0`,
+      { method: "GET", headers: await this.headers(), signal: AbortSignal.timeout(15000) }
+    );
+    if (!res.ok) throw new Error(`获取历史消息失败 (${res.status})`);
+    const data: any = await res.json();
+    const msgs: Array<{ role: "user" | "assistant"; content: string; messageId: number | null }> = [];
+    const chatMsgs = data?.data?.biz_data?.chat_messages;
+    const rawList = Array.isArray(chatMsgs) ? chatMsgs : (chatMsgs?.messages || []);
+    for (const raw of rawList) {
+      const role = raw.role === "USER" ? "user" : raw.role === "ASSISTANT" ? "assistant" : null;
+      if (!role) continue;
+      const frags = Array.isArray(raw.fragments) ? raw.fragments : [];
+      for (const frag of frags) {
+        const isTarget = (role === "user" && frag.type === "REQUEST") || (role === "assistant" && frag.type === "RESPONSE");
+        if (isTarget && frag.content) {
+          msgs.push({ role, content: frag.content, messageId: raw.message_id ?? frag.id ?? null });
+        }
+      }
+    }
+    return { messages: msgs, currentMessageId: data?.data?.biz_data?.chat_session?.current_message_id ?? null };
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const res = await fetch("https://chat.deepseek.com/api/v0/chat_session/delete", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({ chat_session_id: sessionId }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`删除会话失败 (${res.status})`);
+  }
+
+  async updatePinned(sessionId: string, pinned: boolean): Promise<void> {
+    const res = await fetch("https://chat.deepseek.com/api/v0/chat_session/update_pinned", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({ chat_session_id: sessionId, pinned }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`${pinned ? "置顶" : "取消置顶"}失败 (${res.status})`);
+  }
+
+  async updateTitle(sessionId: string, title: string): Promise<void> {
+    const res = await fetch("https://chat.deepseek.com/api/v0/chat_session/update_title", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({ chat_session_id: sessionId, title }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`重命名失败 (${res.status})`);
+  }
+
+  async shareSession(sessionId: string, _shareRounds: number, title?: string): Promise<string> {
+    // 分享始终取最后一对消息（1用户+1助手），DeepSeek API 限制如此
+    const hist = await this.fetchHistoryMessages(sessionId);
+    const allIds = hist.messages.map(m => m.messageId).filter((id): id is number => id !== null);
+    if (allIds.length < 2) throw new Error("该会话没有可分享的对话轮次");
+    const lastPair = allIds.slice(-2);
+    const res = await fetch("https://chat.deepseek.com/api/v0/share/create", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({
+        chat_session_id: sessionId,
+        message_ids: lastPair, share_rounds: 1, title: title || "",
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!res.ok) throw new Error(`分享失败 (${res.status})`);
+    const data: any = await res.json();
+    const shareId = data?.data?.biz_data?.share_id || "";
+    if (!shareId) throw new Error("分享创建失败，未返回 share_id");
+    return shareId;
+  }
+
+  async fetchShareList(count = 20): Promise<Array<{
+    shareId: string; hint: string; createdAt: number; chatSessionId: string;
+  }>> {
+    const res = await fetch(`https://chat.deepseek.com/api/v0/share/list?count=${count}`, {
+      method: "GET", headers: await this.headers(), signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`获取分享列表失败 (${res.status})`);
+    const data: any = await res.json();
+    return (data?.data?.biz_data?.shares || []).map((s: any) => ({
+      shareId: s.share_id || s.id || "",
+      hint: s.hint || "",
+      createdAt: s.created_at || 0,
+      chatSessionId: s.chat_session_id || "",
+    }));
+  }
+
+  async deleteShare(shareId: string): Promise<void> {
+    const res = await fetch("https://chat.deepseek.com/api/v0/share/delete", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({ share_id: shareId }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`删除分享失败 (${res.status})`);
+  }
+
+  async deleteAllSessions(): Promise<void> {
+    const res = await fetch("https://chat.deepseek.com/api/v0/chat_session/delete_all", {
+      method: "POST", headers: await this.headers(),
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) throw new Error(`删除所有会话失败 (${res.status})`);
   }
 
   private async createPowChallenge(targetPath: string) {
@@ -1335,12 +1458,13 @@ class ToolExecutor {
         case "edit": {
           const filePath = this.resolveWorkspacePath(args.filePath);
           const raw = fs.readFileSync(filePath, "utf-8");
-          const ops = (args.operations ?? []) as HlOperation[];
+          const op: HlOperation = { op: (args.op as string) ?? "replace", ref: args.ref as string, endRef: args.endRef as string | undefined, content: args.content as string };
+          const ops = [op];
           const rev = args.fileRev as string | undefined;
-          const safe = args.safeReapply as boolean | undefined;
+          const safe = (args.safeReapply as string) === "true" ? true : undefined;
           const result = applyHashlineEdit(filePath, raw, ops, rev, safe);
           fs.writeFileSync(filePath, result);
-          return `Edit applied: ${ops.length} operation(s)`;
+          return `Edit applied: 1 operation(s)`;
         }
         case "exec":
           return execSync(args.command as string, {
@@ -1390,12 +1514,15 @@ function registerBuiltinTools(registry: ToolRegistry): void {
   });
   registry.register({
     name: "edit",
-    description: "使用 hashline ref 编辑文件。参数: filePath, operations (包含 {op, startRef?, endRef?, ref?, content?} 的数组), fileRev?, safeReapply?。操作: replace/delete/insert_before/insert_after/replace_range。引用格式请严格使用 read 输出中的格式。",
+    description: "使用 hashline ref 编辑文件，每次调用只做一个操作。参数: filePath, op (replace/delete/insert_before/insert_after), ref (从 read 输出原样复制的 #HL N#xxx#yyy), endRef (可选，replace/delete 时指定范围结束行), content, fileRev, safeReapply。",
     parameters: {
       filePath: { type: "string", description: "文件路径" },
-      operations: { type: "string", description: "操作数组的 JSON，使用 read 输出中的 startRef/endRef" },
-      fileRev: { type: "string", description: "read 输出中的 REV 令牌，用于检测过期编辑" },
-      safeReapply: { type: "string", description: "如果 hash 匹配但行位置变化，允许重新定位 ref" },
+      op: { type: "string", description: "操作类型: replace / delete / insert_before / insert_after" },
+      ref: { type: "string", description: "目标行的 #HL 引用，从 read 输出原样复制" },
+      endRef: { type: "string", description: "可选，范围的结束行 #HL 引用，用于 replace/delete 多行" },
+      content: { type: "string", description: "新内容（replace/insert 时需要）" },
+      fileRev: { type: "string", description: "read 输出中的 REV 令牌，防止过期编辑" },
+      safeReapply: { type: "string", description: "设为 true 时，hash 匹配但行号移动时自动重定位" },
     },
   });
   registry.register({
@@ -1809,7 +1936,7 @@ async function loginDeepseek(
   if (!wsUrl) throw new Error("未找到 WebSocket 调试 URL");
 
   onProgress("正在连接浏览器...");
-  const browser = await chromium.connectOverCDP(wsUrl);
+  const browser = await chromium.connectOverCDP(wsUrl, { timeout: 60000 });
   const context = browser.contexts()[0] ?? (await browser.newContext());
 
   let userAgent = "";
@@ -2021,7 +2148,7 @@ type CommandResult =
   | { type: "session"; value: ChatSession | null }
   | { type: "quit" }
   | { type: "load_interactive" }
-  | { type: "confirm"; action: string; id?: string; newId?: number; mode?: string }
+  | { type: "confirm"; action: string; id?: string; title?: string; newId?: number; mode?: string }
   | { type: "cd_switched"; dir: string }
 
 async function handleCommand(
@@ -2099,6 +2226,100 @@ async function handleCommand(
           const time = formatTime(s.updatedAt);
           log(`   ${i + 1}  ID: ${s.id}  ·  ${s.title}  ·  ${s.rounds} 轮  ·  ${time}${fork}`);
         });
+      }
+      return session;
+    }
+
+    case "c": case "cloud": {
+      try {
+        if (args[0] === "-sl") {
+          const shares = await ctx.client.fetchShareList(50);
+          if (shares.length === 0) { log("  暂无分享链接"); return session; }
+          log(`  共 ${shares.length} 个分享链接：\n`);
+          shares.forEach((sh: any, i: number) => {
+            const time = sh.createdAt ? formatTime(sh.createdAt * 1000) : "";
+            log(`   [${i + 1}] ${sh.hint ? `"${sh.hint.slice(0, 30)}"` : "无"}  ·  ${time}`);
+            log(`       🔗 https://chat.deepseek.com/share/${sh.shareId}`);
+          });
+          log("\n  /c -us <序号> 取消分享");
+          return session;
+        }
+
+        if (args[0] === "-us" && args[1]) {
+          const shares = await ctx.client.fetchShareList(50);
+          const idx = parseInt(args[1], 10);
+          if (isNaN(idx) || idx < 1 || idx > shares.length) { log("❌ 无效序号"); return session; }
+          const sh = shares[idx - 1];
+          await ctx.client.deleteShare(sh.shareId);
+          log(`✅ 已删除分享: ${sh.shareId}`);
+          return session;
+        }
+
+        log("☁️ 正在获取云端会话列表...");
+        const sessions = await ctx.client.fetchSessionList(50);
+        if (sessions.length === 0) {
+          log("  云端暂无会话");
+          return session;
+        }
+        const localIds = new Set(ctx.store.list().map((s: any) => s.id));
+        log(`  云端共 ${sessions.length} 个会话：\n`);
+        sessions.forEach((s: any, i: number) => {
+          const pin = s.pinned ? "📌 " : "";
+          const time = s.updated_at ? formatTime(s.updated_at * 1000) : "";
+          const local = localIds.has(s.id) ? " 📎已本地化" : "";
+          log(`   [${i + 1}] ${pin}${s.title || "未命名"}  ·  ${s.model_type || ""}  ·  ${time}${local}`);
+        });
+
+        // 删除：/c -d <N> 删除单个，/c -d all 删除全部
+        if (args[0] === "-d" && args[1]) {
+          if (args[1] === "all") {
+            log(`⚠️ 确认删除云端所有 ${sessions.length} 个会话？本地不受影响 (y/n)`);
+            return { type: "confirm", action: "CLOUD_DELETE_ALL" } as CommandResult;
+          }
+          const idx = parseInt(args[1], 10);
+          if (isNaN(idx) || idx < 1 || idx > sessions.length) { log("❌ 无效序号"); return session; }
+          const s = sessions[idx - 1];
+          log(`⚠️ 确认删除云端会话 "${s.title}"？(y/n)`);
+          return { type: "confirm", action: "CLOUD_DELETE", id: s.id, title: s.title } as CommandResult;
+        }
+
+        // 置顶/取消置顶
+        if (args[0] === "-p" && args[1]) {
+          const idx = parseInt(args[1], 10);
+          if (isNaN(idx) || idx < 1 || idx > sessions.length) { log("❌ 无效序号"); return session; }
+          const s = sessions[idx - 1];
+          const newPinned = !s.pinned;
+          await ctx.client.updatePinned(s.id, newPinned);
+          log(`✅ 已${newPinned ? "置顶" : "取消置顶"}: ${s.title}`);
+          return session;
+        }
+
+        // 重命名
+        if (args[0] === "-r" && args[1] && args[2]) {
+          const idx = parseInt(args[1], 10);
+          if (isNaN(idx) || idx < 1 || idx > sessions.length) { log("❌ 无效序号"); return session; }
+          const s = sessions[idx - 1];
+          const newTitle = args.slice(2).join(" ");
+          await ctx.client.updateTitle(s.id, newTitle);
+          log(`✅ 已重命名: ${newTitle}`);
+          return session;
+        }
+
+        // 分享云端会话
+        if (args[0] === "-s" && args[1]) {
+          const idx = parseInt(args[1], 10);
+          if (isNaN(idx) || idx < 1 || idx > sessions.length) { log("❌ 无效序号"); return session; }
+          const s = sessions[idx - 1];
+          log(`⏳ 正在创建分享链接 (最近一轮)...`);
+          const shareId = await ctx.client.shareSession(s.id, 1, s.title);
+          const shareUrl = `https://chat.deepseek.com/share/${shareId}`;
+          log(`🔗 分享链接: ${shareUrl}`);
+          return session;
+        }
+
+        log("用法: /c <N> 加载  -d <N>|all 删除  -p 置顶  -r 改名  -s 分享  -sl 分享列表  -us <N> 取消分享  /? 查看全部");
+      } catch (err: any) {
+        log(`❌ ${err.message}`);
       }
       return session;
     }
@@ -2381,7 +2602,8 @@ async function handleCommand(
       log("会话:");
       log("  /new  [标题]      创建新会话");
       log("  /load [id]        切换会话（无参数时交互式选择）");
-      log("  /list, /ls        列出所有会话");
+      log("  /list, /ls        列出所有本地会话");
+      log("  /cloud, /c        列出云端会话\n    <序号>           加载到本地（含历史）\n    -l <序号>         同 <序号>\n    -d <序号>|all     删除单个或全部\n    -p <序号>         置顶/取消\n    -r <序号> <标题>  重命名\n    -s <序号>         分享\n    -sl               列出分享链接\n    -us <N>           取消分享");
       log("  /del  [id|--all]  删除会话（无参数时交互式）");
       log("  /parent <id>, /p  手动覆盖续接点（需确认）");
       log("  /fork [id] [标题], /f  分叉新会话");
@@ -2447,7 +2669,6 @@ async function handleCommand(
 
     default:
       log(`❌ 未知命令: /${cmd}，输入 /? 查看帮助`);
-      log("可用命令: new load ls del p f s history sys rj t think search m up raw auth reauth cd ?,h help q quit clear pwd");
       return session;
   }
 }
@@ -2843,6 +3064,17 @@ async function startRepl(): Promise<void> {
         ctx.store.delete(id);
         if (session && session.sessionId === id) session = null;
         console.log(`✅ 已删除 ${id} - ${target?.title || ""}`);
+      } else if (action.startsWith("CLOUD_DELETE:")) {
+        const rest = action.slice(13);
+        const sepIdx = rest.indexOf(":");
+        const id = sepIdx >= 0 ? rest.slice(0, sepIdx) : rest;
+        const title = sepIdx >= 0 ? rest.slice(sepIdx + 1) : "";
+        await ctx.client.deleteSession(id);
+        console.log(`✅ 已从云端删除: ${id.slice(0, 8)} - ${title || ""}`);
+      } else if (action === "CLOUD_DELETE_ALL") {
+        await ctx.client.deleteAllSessions();
+        session = null;
+        console.log(`✅ 已删除云端全部会话（本地未受影响）`);
       }
       rl.setPrompt(getPrompt(session, ctx.rawMode));
       rl.prompt();
@@ -2938,6 +3170,14 @@ async function startRepl(): Promise<void> {
           } else if (result.type === "confirm" && result.action === "DEL_SINGLE") {
             pendingAction = "DEL_SINGLE:" + result.id;
             rl.setPrompt("确认删除？(y/n) > ");
+            session = prevSession;
+          } else if (result.type === "confirm" && result.action === "CLOUD_DELETE") {
+            pendingAction = "CLOUD_DELETE:" + result.id + ":" + (result.title || "");
+            rl.setPrompt("确认删除云端会话？(y/n) > ");
+            session = prevSession;
+          } else if (result.type === "confirm" && result.action === "CLOUD_DELETE_ALL") {
+            pendingAction = "CLOUD_DELETE_ALL";
+            rl.setPrompt("⚠️ 确认删除云端全部会话？(y/n) > ");
             session = prevSession;
           } else if (result.type === "confirm" && result.action === "REINJECT") {
             pendingAction = "REINJECT:" + result.mode;

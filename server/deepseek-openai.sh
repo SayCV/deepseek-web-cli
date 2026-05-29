@@ -2,13 +2,20 @@
 LOGFILE="server/deepseek-openai.log"
 DEFAULT_PORT=${PORT:-8899}
 DEFAULT_HOST=${HOST:-127.0.0.1}
+SCRIPT_DIR="$(dirname "$0")"
+
+if command -v bun &> /dev/null; then
+  RUNNER="bun run ${SCRIPT_DIR}/bin/deepseek-openai.ts"
+else
+  RUNNER="npx tsx ${SCRIPT_DIR}/bin/deepseek-openai.ts"
+fi
 
 start() {
   if pgrep -f "deepseek-openai.ts" > /dev/null; then
     echo "服务已在运行"
     return 1
   fi
-  nohup npx tsx "$(dirname "$0")/bin/deepseek-openai.ts" serve --host "$DEFAULT_HOST" --port "$DEFAULT_PORT" >> "$LOGFILE" 2>&1 &
+  nohup $RUNNER serve --host "$DEFAULT_HOST" --port "$DEFAULT_PORT" >> "$LOGFILE" 2>&1 &
   echo "服务已启动在 http://${DEFAULT_HOST}:${DEFAULT_PORT} (PID: $!)"
 }
 

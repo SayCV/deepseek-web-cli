@@ -44,24 +44,27 @@ deepseek-web-cli-v3/
 ### 前置条件
 
 - **[Node.js](https://nodejs.org) 22+** 或 **[bun](https://bun.sh)** 运行时
+- **[tsx](https://tsx.is)** — TypeScript 执行器（`npm install -g tsx`）
 - **Chrome 浏览器**（仅首次登录时需要，带 `--remote-debugging-port=9222`）
-- **playwright-core**（CDP 连接 Chrome 获取凭证，仅首次登录时需要）
+- **playwright-core**（CDP 连接 Chrome 获取凭证，仅首次登录时需要：`npm install playwright-core`）
 - Android Termux 额外：`android-tools` + `adb forward tcp:9222 localabstract:chrome_devtools_remote`
 
 ### 快速开始
 
 ```bash
 # 1. 安装依赖（仅首次）
-npm install -g tsx
-npm install playwright-core     # CDP 连接 Chrome 获取凭证，仅首次登录时需要
+npm install -g tsx                          # 全局安装，之后 tsx 命令随处可用
+npm install playwright-core                 # CDP 登录，仅首次需要
 
-# 2. 启动 REPL（首次运行会自动触发登录流程）
-./cli/chat.ts
-
-# 3. 或使用 bun 效率更高（自动安装 playwright-core 相关依赖）
-npm install -g bun
-bun run cli/chat.ts
+# 2. 启动 REPL（三种方式，任选其一）
+./cli/chat.ts                               # 直接执行（需要 tsx 全局安装，chat.ts 自带 shebang）
+tsx ./cli/chat.ts                           # 用 tsx 命令显式执行
+bun run ./cli/chat.ts                       # 或使用 bun（npm install -g bun）
 ```
+
+> 首次运行时会触发登录流程；凭证过期后自动重新登录，或在 REPL 中 `/reauth`。
+>
+> 如果 `./cli/chat.ts` 报 `tsx: command not found`，说明 tsx 未全局安装或不在 PATH 中，改用 `npx tsx ./cli/chat.ts`。
 
 凭证缺失或过期时自动通过 Chrome DevTools Protocol 捕获 cookie 和 bearer token，保存到 `cli/credentials.json`。
 
@@ -96,12 +99,25 @@ curl -s http://127.0.0.1:9222/json/version
 |------|------|
 | `/new [标题]` | 创建新会话 |
 | `/load [id]` | 切换会话（无参数时交互式选择） |
-| `/ls, /list` | 列出所有会话 |
+| `/ls, /list` | 列出所有本地会话 |
 | `/del [id\|--all]` | 交互式删除 / 指定删除 / 全删 |
 | `/parent, /p <id>` | 手动覆盖续接点 |
 | `/fork, /f [id] [标题]` | 分叉新会话 |
 | `/save, /s` | 手动保存 |
 | `/history [-r N] [-a] [-id <id>]` | 查看历史 |
+
+**云端会话管理 (`/cloud`, `/c`)**
+
+| 命令 | 说明 |
+|------|------|
+| `/c` | 列出云端所有会话 |
+| `/c <N>` | 加载云端会话到本地（含完整历史） |
+| `/c -d <N>\|all` | 删除单个 / 全部云端会话（需确认） |
+| `/c -p <N>` | 置顶 / 取消置顶 |
+| `/c -r <N> <标题>` | 重命名 |
+| `/c -s <N>` | 分享最近一轮为链接 |
+| `/c -sl` | 查看所有已分享链接 |
+| `/c -us <N>` | 取消分享 |
 
 **提示词管理**
 
@@ -155,7 +171,7 @@ curl -s http://127.0.0.1:9222/json/version
 |------|------|
 | `read` | 读取文件内容（输出带 hashline 标注） |
 | `write` | 写入文件（自动清洗 hashline 标注）[需确认] |
-| `edit` | 行级精确编辑（hashline 引用的 6 种操作）[需确认] |
+| `edit` | 行级精确编辑（hashline ref 引用，扁平参数）[需确认] |
 | `exec` | 执行系统命令 [需确认] |
 | `web_fetch` | 抓取 HTTP/HTTPS URL 内容 |
 
@@ -185,9 +201,9 @@ npx tsx server/bin/deepseek-openai.ts serve
 npx tsx server/bin/deepseek-openai.ts serve --port 18899     # 自定义端口
 
 # 3. 或使用 bun 效率更高
-bun run server/bin/deepseek-openai.ts serve
+bun run ./server/bin/deepseek-openai.ts serve
 
-# 4. 或后台运行（管理脚本）
+# 4. 或后台运行（管理脚本，自动检测 bun/tsx）
 bash server/deepseek-openai.sh start      # 后台启动
 bash server/deepseek-openai.sh status     # 查看运行状态
 bash server/deepseek-openai.sh restart    # 重启
@@ -199,7 +215,6 @@ PORT=18899 bash server/deepseek-openai.sh start
 HOST=0.0.0.0 PORT=8899 bash server/deepseek-openai.sh start
 ```
 
-> **注意**：Android/Termux 环境下 bun 1.3.14 无法 `nohup` 后台运行（`CouldntReadCurrentDirectory` 错误），管理脚本已适配为 `npx tsx`。
 
 ### API 端点
 
@@ -312,6 +327,93 @@ for chunk in stream:
 - **ToolRegistry/ToolExecutor**：工具注册与执行（含用户确认机制）
 - **Hashline 核心**：行级 SHA1 哈希标注、ref 解析、编辑冲突检测、fileRev 版本校验、safeReapply 自动重定位
 
+### 工具调用机制
+
+CLI **不使用 DeepSeek 原生工具调用 API**（传 `tools=undefined`），而是采用 **prompt 注入 + 文本解析** 方案。
+
+**完整流程：**
+
+```
+1. 注册工具 → registerBuiltinTools() 注册 5 个工具到 ToolRegistry
+
+2. 提示词注入（仅首轮）
+   ┌─────────────────────────────────────────────┐
+   │ [systemPrompt]       ← .deepseek/system.md  │
+   │ [thinkInjectionPrompt] ← 思考模式开时注入    │
+   │ [toolsPrompt]        ← buildToolPrompt()     │
+   │ [toolMdContent]      ← .deepseek/tool.md     │
+   │ [skillMdContent]     ← .deepseek/skill.md    │
+   │                                             │
+   │ User: 用户消息                               │
+   └─────────────────────────────────────────────┘
+
+3. 模型生成响应（纯文本，无原生 tool_call）
+
+4. StreamParser 解析 → extractToolCall() 提取 tool_json
+
+5. ToolExecutor 执行工具 → 返回结果
+
+6. 结果回传 → <tool_response> 作为新 prompt → 下一轮循环（最多 10 次）
+```
+
+**工具提示词实际内容（buildToolPrompt 输出）：**
+
+```
+## 可用工具
+[{"name":"read","description":"从给定路径读取文件内容。","parameters":{"path":"string"}},...]
+
+示例: 要给数字5加1，返回:
+```tool_json
+{"tool":"plus_one","parameters":{"number":"5"}}
+```
+plus_one 只是格式示例，不是真实工具。
+需要调用真实工具时，只回复 tool_json 代码块，不要附加说明。
+```
+
+**正确调用格式：**
+
+```tool_json
+{"tool":"read","parameters":{"path":"src/main.ts"}}
+```
+
+```tool_json
+{"tool":"edit","parameters":{
+  "filePath": "src/main.ts",
+  "op": "replace",
+  "ref": "#HL 3#C78#E90",
+  "content": "新内容",
+  "fileRev": "A1B2C3D4"
+}}
+```
+
+```tool_json
+{"tool":"write","parameters":{"path":"src/new.ts","content":"文件内容"}}
+```
+
+```tool_json
+{"tool":"exec","parameters":{"command":"ls -la"}}
+```
+
+```tool_json
+{"tool":"web_fetch","parameters":{"url":"https://example.com"}}
+```
+
+**解析器支持两种格式：**
+- **Fenced**：````tool_json { ... } ```（推荐）
+- **Bare**：直接在文本中的 `{"tool":"...","parameters":{...}}`
+
+**自定义工具提示词：** 在 `.deepseek/tool.md` 中添加详细工具使用说明（如 `cli/Test/test33/.deepseek/tool.md` 有 150 行示例），会在首轮注入时拼接到提示词中。
+
+**工具参数对照表：**
+
+| 工具 | 参数名 | 说明 |
+|------|--------|------|
+| `read` | `path` | 文件路径 |
+| `write` | `path`, `content` | 文件路径, 写入内容 |
+| `edit` | `filePath`, `op`, `ref`, `endRef?`, `content`, `fileRev`, `safeReapply` | 文件路径, 操作类型, 起始行引用, 结束行引用(可选), 新内容, 版本指纹, 自动重定位 |
+| `exec` | `command` | Shell 命令 |
+| `web_fetch` | `url` | HTTP/HTTPS URL |
+
 ---
 
 ## Server 工作原理
@@ -358,7 +460,7 @@ OpenAI 客户端        ← 标准 SSE 流返回
   → 返回 <hashline-file> 包裹的标注内容，每行带 #HL N#hash#anchor|
   → #HL REV:xxxxxxxx 为文件版本指纹
 
-模型调用 edit { filePath, operations: [{ op: "replace", startRef: "#HL 3#A4F#9BC", content: "..." }], fileRev: "xxxxxxxx" }
+模型调用 edit { filePath, op: "replace", ref: "#HL 3#A4F#9BC", content: "...", fileRev: "xxxxxxxx" }
   → 读文件现场计算 rev，与 fileRev 对比
   → 解析 refs，校验每行的 hash 和 anchor 是否匹配
   → 检测操作间是否有重叠冲突
@@ -370,16 +472,14 @@ OpenAI 客户端        ← 标准 SSE 流返回
   → 写入文件，清除 rev 缓存
 ```
 
-### 六种操作
+### 四种操作
 
 | 操作 | 说明 |
 |------|------|
-| `replace` | 替换 startRef 到 endRef 范围（无 endRef 则替换单行） |
-| `delete` | 删除 startRef 到 endRef 范围 |
-| `insert_before` | 在 startRef 之前插入内容 |
-| `insert_after` | 在 endRef 之后插入内容 |
-| `replace_range` | 替换 startRef 到 endRef 范围（需同时传两者） |
-| `set_file` | 全量覆盖文件（不能与其他操作混用） |
+| `replace` | 替换 ref 行（传 endRef 则替换范围） |
+| `delete` | 删除 ref 行（传 endRef 则删除范围） |
+| `insert_before` | 在 ref 行之前插入内容 |
+| `insert_after` | 在 ref 行之后插入内容 |
 
 ### 安全机制
 
@@ -396,8 +496,10 @@ OpenAI 客户端        ← 标准 SSE 流返回
 ## 测试
 
 ```bash
-# CLI 自动化测试（87 项）
-# 或使用 npx（需要先全局安装 tsx）
+# 方式一：全局安装 tsx 后直接运行
+tsx --test cli/Test/test.test.ts
+
+# 方式二：使用 npx
 npx tsx --test cli/Test/test.test.ts
 
 # 手动测试方案
