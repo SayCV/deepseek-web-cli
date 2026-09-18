@@ -8,6 +8,17 @@ import * as readline from "node:readline";
 import { execSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+const env = typeof Deno !== "undefined" ? Deno.env : process.env;
+const cur = env.get?.("NO_PROXY") ?? (env as any).NO_PROXY;
+if (!cur?.includes("127.0.0.1")) {
+  const next = cur ? `${cur},127.0.0.1,localhost` : "127.0.0.1,localhost";
+  if ("set" in env) {
+    (env as any).set("NO_PROXY", next);   // Deno
+  } else {
+    (env as any).NO_PROXY = next;         // Node
+  }
+}
+
 // ============ 第2部分：类型定义 ============
 
 interface Credentials {
